@@ -1,0 +1,126 @@
+name: Release on version bump
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - pyproject.toml
+
+jobs:
+  check-and-release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Read version
+        id: version
+        run: |
+          VERSION=$(grep '^version' pyproject.toml | head -1 | sed 's/version = "\(.*\)"/\1/')
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "tag=v$VERSION" >> $GITHUB_OUTPUT
+          echo "Detected version: $VERSION"
+
+      - name: Check if tag already exists
+        id: tag_check
+        run: |
+          if git tag | grep -q "^v${{ steps.version.outputs.version }}$"; then
+            echo "exists=true" >> $GITHUB_OUTPUT
+            echo "Tag v${{ steps.version.outputs.version }} already exists, skipping."
+          else
+            echo "exists=false" >> $GITHUB_OUTPUT
+            echo "New version detected: v${{ steps.version.outputs.version }}"
+          fi
+
+      - name: Install uv
+        if: steps.tag_check.outputs.exists == 'false'
+        uses: https://github.com/astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+
+      - name: Build wheel
+        if: steps.tag_check.outputs.exists == 'false'
+        run: uv build
+
+      - name: Generate release notes
+        if: steps.tag_check.outputs.exists == 'false'
+        id: notes
+        run: |
+          LAST_TAG=$(git tag --sort=-version:refname | head -1)
+          if [ -z "$LAST_TAG" ]; then
+            # Pas de tag précédent : on prend tous les commits
+            COMMITS=$(git log --pretty=format:"- %s" HEAD)
+          else
+            COMMITS=$(git log --pretty=format:"- %s" "$LAST_TAG"..HEAD)
+          fi
+
+          # Écrit les notes dans un fichier (évite les problèmes de quotes)
+          cat > /tmp/release_notes.md << EOF
+          ## What's changed
+
+          $COMMITS
+
+          ## Assets
+
+          - \`file_cipher-${{ steps.version.outputs.version }}-py3-none-any.whl\` — installable wheel
+          - \`file_cipher-${{ steps.version.outputs.version }}.tar.gz\` — source archive
+          EOF
+
+          echo "Notes written to /tmp/release_notes.md"
+          cat /tmp/release_notes.md
+
+      - name: Create tag and release
+        if: steps.tag_check.outputs.exists == 'false'
+        env:
+          CODEBERG_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.tag_check.outputs.tag }}
+          VERSION: ${{ steps.version.outputs.version }}
+          REPO: ${{ github.repository }}
+          API: ${{ github.server_url }}/api/v1
+        run: |
+          # Crée le tag via l'API
+          curl -s -X POST "$API/repos/$REPO/tags" \
+            -H "Authorization: token $CODEBERG_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d "{\"tag_name\": \"$TAG\", \"message\": \"Release $TAG\"}"
+
+          echo "Tag $TAG created."
+
+          # Crée la release avec les notes
+          RELEASE_BODY=$(cat /tmp/release_notes.md | python3 -c "
+          import sys, json
+          print(json.dumps(sys.stdin.read()))
+          ")
+
+          RELEASE_ID=$(curl -s -X POST "$API/repos/$REPO/releases" \
+            -H "Authorization: token $CODEBERG_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d "{
+              \"tag_name\": \"$TAG\",
+              \"name\": \"$TAG\",
+              \"body\": $RELEASE_BODY,
+              \"draft\": false,
+              \"prerelease\": false
+            }" | python3 -c "import sys,json; print(json.load(sys.stdin)['id'])")
+
+          echo "Release created with id: $RELEASE_ID"
+
+          # Upload le .whl
+          WHL=$(ls dist/*.whl)
+          curl -s -X POST "$API/repos/$REPO/releases/$RELEASE_ID/assets" \
+            -H "Authorization: token $CODEBERG_TOKEN" \
+            -F "attachment=@$WHL"
+
+          # Upload le .tar.gz
+          TGZ=$(ls dist/*.tar.gz)
+          curl -s -X POST "$API/repos/$REPO/releases/$RELEASE_ID/assets" \
+            -H "Authorization: token $CODEBERG_TOKEN" \
+            -F "attachment=@$TGZ"
+
+          echo "✓ Release $TAG published with wheel and source archive."
