@@ -59,21 +59,29 @@ def _derive_key(password: str, salt: bytes, iterations: int = PBKDF2_ITER) -> by
     return kdf.derive(password.encode())
 
 
-def _encrypt_data(plaintext: bytes, password: str) -> bytes:
-    """Encrypts data and returns the full stream (header + ciphertext)."""
+def _encrypt_data(plaintext: bytes, password: str, filename: str) -> bytes:
+    """Encrypts data and returns the full stream (header + ciphertext).
+    The original filename is embedded inside the encrypted payload.
+    Payload format: [4 bytes: name length] + [name bytes] + [file content]
+    """
     salt  = secrets.token_bytes(SALT_SIZE)
     nonce = secrets.token_bytes(NONCE_SIZE)
     key   = _derive_key(password, salt)
 
+    name_bytes = filename.encode()
+    payload    = struct.pack(">I", len(name_bytes)) + name_bytes + plaintext
+
     aesgcm     = AESGCM(key)
-    ciphertext = aesgcm.encrypt(nonce, plaintext, None)  # None = no AAD
+    ciphertext = aesgcm.encrypt(nonce, payload, None)
 
     header = struct.pack(HEADER_FMT, MAGIC, PBKDF2_ITER, salt, nonce)
     return header + ciphertext
 
 
-def _decrypt_data(blob: bytes, password: str) -> bytes:
-    """Decrypts a stream produced by _encrypt_data."""
+def _decrypt_data(blob: bytes, password: str) -> tuple[bytes, str]:
+    """Decrypts a stream produced by _encrypt_data.
+    Returns (file content, original filename).
+    """
     if len(blob) < HEADER_SIZE:
         raise ValueError("File too short or corrupted.")
 
@@ -89,9 +97,14 @@ def _decrypt_data(blob: bytes, password: str) -> bytes:
     ciphertext = blob[HEADER_SIZE:]
 
     try:
-        return aesgcm.decrypt(nonce, ciphertext, None)
+        payload = aesgcm.decrypt(nonce, ciphertext, None)
     except Exception:
         raise ValueError("Wrong password or file has been tampered with.")
+
+    name_len = struct.unpack(">I", payload[:4])[0]
+    filename = payload[4:4 + name_len].decode()
+    content  = payload[4 + name_len:]
+    return content, filename
 
 
 # ── UI helpers ───────────────────────────────────────────────────────────────
@@ -126,7 +139,7 @@ def encrypt(
     overwrite: bool = typer.Option(False, "--overwrite", help="Overwrite if destination exists"),
 ):
     """🔒 Encrypt a file with AES-256-GCM."""
-    dest = output or file.with_suffix(file.suffix + ".enc")
+    dest = output or file.with_suffix(".enc")
 
     if dest.exists() and not overwrite:
         console.print(f"[yellow]⚠ '{dest}' already exists. Use --overwrite to replace it.[/yellow]")
@@ -143,7 +156,7 @@ def encrypt(
         plaintext = file.read_bytes()
 
         progress.update(task, advance=1, description="AES-GCM encryption…")
-        encrypted = _encrypt_data(plaintext, password)
+        encrypted = _encrypt_data(plaintext, password, file.name)
 
         progress.update(task, advance=1, description="Writing…")
         dest.write_bytes(encrypted)
@@ -169,15 +182,12 @@ def decrypt(
 ):
     """🔓 Decrypt a file produced by 'cipher encrypt'."""
     if output:
-        dest = output
-    elif file.suffix == ".enc":
-        dest = file.with_suffix("")
+        dest: Optional[Path] = output
+        if dest.exists() and not overwrite:
+            console.print(f"[yellow]⚠ '{dest}' already exists. Use --overwrite to replace it.[/yellow]")
+            raise typer.Exit(1)
     else:
-        dest = file.with_suffix(".dec")
-
-    if dest.exists() and not overwrite:
-        console.print(f"[yellow]⚠ '{dest}' already exists. Use --overwrite to replace it.[/yellow]")
-        raise typer.Exit(1)
+        dest = None
 
     console.print(Panel(f"[bold]Decrypting[/bold] [cyan]{file}[/cyan]", expand=False))
     password = _ask_password(confirm=False)
@@ -191,10 +201,18 @@ def decrypt(
 
         progress.update(task, description="Deriving key & decrypting…")
         try:
-            plaintext = _decrypt_data(blob, password)
+            plaintext, original_name = _decrypt_data(blob, password)
         except ValueError as exc:
             console.print(f"\n[red]✗ Failed: {exc}[/red]")
             raise typer.Exit(1)
+
+        if not output:
+            dest = file.parent / original_name
+            if dest.exists() and not overwrite:
+                console.print(f"[yellow]⚠ '{dest}' already exists. Use --overwrite to replace it.[/yellow]")
+                raise typer.Exit(1)
+        elif Path(output).suffix != Path(original_name).suffix:
+            console.print(f"[yellow]⚠ Original file was '{original_name}' — saving as '{output.name}' instead.[/yellow]")
 
         progress.update(task, description="Writing…")
         dest.write_bytes(plaintext)
