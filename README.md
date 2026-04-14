@@ -10,14 +10,20 @@ CLI file encryption tool based on **AES-256-GCM** and **PBKDF2-SHA256**.
 
 ## Installation
 
+### Clone the project
+
 ```bash
-# Clone / create the project
+git clone https://codeberg.org/GautierPicon/file_cipher.git 
 cd file-cipher
+```
 
-# Install dependencies and create environment with uv
+### Install dependencies and create environment with uv
+```bash
 uv sync
+```
 
-# Run via uv run
+### Run via uv run
+```bash
 uv run cipher --help
 ```
 
@@ -56,23 +62,25 @@ cipher info --help
 
 ### Encrypt a file
 ```bash
-uv run cipher encrypt secret.txt
-# → creates secret.txt.enc
+# Encrypt the file secret.txt to secret.enc
+cipher encrypt secret.txt
 
-uv run cipher encrypt rapport.pdf -o vault.enc
+# Encrypt rapport.pdf and name it vault.enc
+cipher encrypt rapport.pdf -o vault.enc
 ```
 
 ### Decrypt a file
 ```bash
-uv run cipher decrypt secret.txt.enc
-# → recreates secret.txt
+# Decrypt secret.enc to secret.txt
+cipher decrypt secret.enc
 
-uv run cipher decrypt vault.enc -o restored_report.pdf
+# Decrypt vault.enc and name it restored_report.pdf
+cipher decrypt vault.enc -o restored_report.pdf
 ```
 
 ### Inspect an encrypted file (without decrypting)
 ```bash
-uv run cipher info secret.txt.enc
+cipher info secret.enc
 ```
 
 ## `.enc` file format
