@@ -1,7 +1,7 @@
 [project]
 name = "file-cipher"
 version = "0.4.0"
-description = "Command-line tool for file encryption using AES-GCM"
+description = "Command-line tool for file encryption"
 readme = "README.md"
 authors = [
     { name = "GautierPicon", email = "bt2ay5d9@anonaddy.com" }
