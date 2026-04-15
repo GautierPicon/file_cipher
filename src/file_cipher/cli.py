@@ -234,7 +234,7 @@ def encrypt(
         strong, warning = _check_password_strength(password)
         if warning:
             console.print(f"  {warning}")
-            confirm = console.input("  [dim]Continue anyway? [y/N]: [/dim]")
+            confirm = console.input("  [dim]Continue anyway? (y/n): [/dim]")
             if confirm.lower() in ("y", "yes"):
                 break
             password = _ask_password(confirm=True)
