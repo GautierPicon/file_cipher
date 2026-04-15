@@ -1,7 +1,10 @@
 import os
+import math
+import string
 import struct
 import hashlib
 import secrets
+import subprocess
 import typer
 from pathlib import Path
 from typing import Optional
@@ -160,6 +163,7 @@ def decrypt(
     output: Optional[Path] = typer.Option(None, "-o", "--output", help="Output file"),
     overwrite: bool = typer.Option(False, "--overwrite", help="Overwrite if destination exists"),
 ):
+    """🔓 Decrypt a file produced by 'cipher encrypt'."""
     if output:
         dest: Optional[Path] = output
         if dest.exists() and not overwrite:
@@ -204,6 +208,7 @@ def decrypt(
 def info(
     file: Path = typer.Argument(..., help=".enc file to inspect", exists=True),
 ):
+    """ℹ️  Display metadata of an encrypted file (without decrypting it)."""
     blob = file.read_bytes()
 
     if len(blob) < HEADER_SIZE:
@@ -230,6 +235,45 @@ def info(
     table.add_row("[bold]SHA-256[/bold]",      sha256_full)
 
     console.print(table)
+
+
+@app.command()
+def genpass(
+    length: int = typer.Option(20, "-l", "--length", help="Password length (min 16)"),
+    no_copy: bool = typer.Option(False, "--no-copy", help="Don't copy to clipboard"),
+):
+    """🎲 Generate a strong random password."""
+    if length < 16:
+        console.print("[red]Minimum length is 16 characters.[/red]")
+        raise typer.Exit(1)
+
+    alphabet = string.ascii_letters + string.digits + "!@#$%^&*-_=+?"
+
+    password = [
+        secrets.choice(string.ascii_uppercase),
+        secrets.choice(string.ascii_lowercase),
+        secrets.choice(string.digits),
+        secrets.choice("!@#$%^&*-_=+?"),
+    ]
+    password += [secrets.choice(alphabet) for _ in range(length - 4)]
+    secrets.SystemRandom().shuffle(password)
+    password = "".join(password)
+
+    entropy = math.log2(len(alphabet) ** length)
+
+    console.print(Panel(f"[bold green]{password}[/bold green]", title="Generated password", expand=False))
+    console.print(f"  Entropy : [cyan]{entropy:.0f} bits[/cyan]  |  Length : [cyan]{length}[/cyan]  |  Alphabet : [cyan]{len(alphabet)} chars[/cyan]")
+
+    if not no_copy:
+        try:
+            subprocess.run(["pbcopy"], input=password.encode(), check=True)
+            console.print("  [dim]✓ Copied to clipboard[/dim]")
+        except (FileNotFoundError, subprocess.CalledProcessError):
+            try:
+                subprocess.run(["xclip", "-selection", "clipboard"], input=password.encode(), check=True)
+                console.print("  [dim]✓ Copied to clipboard[/dim]")
+            except (FileNotFoundError, subprocess.CalledProcessError):
+                console.print("  [dim]Could not copy to clipboard — paste manually.[/dim]")
 
 
 if __name__ == "__main__":
