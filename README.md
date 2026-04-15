@@ -1,4 +1,4 @@
-# file-cipher
+# file-cipher [![MIT License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE.md)
 
 CLI file encryption tool based on **AES-256-GCM** and **PBKDF2-SHA256**.
 
