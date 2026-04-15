@@ -230,6 +230,10 @@ def encrypt(
     console.print(Panel(f"[bold]Encrypting[/bold] [cyan]{file}[/cyan]", expand=False))
     password = _ask_password(confirm=True)
 
+    strong, warning = _check_password_strength(password)
+    if warning:
+        console.print(f"  {warning}")
+
     file_size = file.stat().st_size
     is_streaming = file_size > STREAMING_THRESHOLD
 
