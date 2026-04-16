@@ -12,6 +12,7 @@ from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 from getpass import getpass
 from pathlib import Path, PurePath
 from typing import Optional
+from importlib.metadata import version as get_version
 
 from rich.console import Console
 from rich.panel import Panel
@@ -22,8 +23,12 @@ app = typer.Typer(
     name="cipher",
     help="🔐 AES-256-GCM file encryption",
     add_completion=False,
+    invoke_without_command=True,
 )
+app.context_settings = {"help_option_names": ["-h", "--help"]}
+
 console = Console()
+APP_VERSION = get_version("cipher")
 
 MAGIC = b"CIPHER02"
 SALT_SIZE = 32
@@ -34,6 +39,25 @@ CHUNK_SIZE = 8 * 1024 * 1024
 
 HEADER_FMT = f">8sI{SALT_SIZE}s{NONCE_SIZE}sQH"
 HEADER_SIZE = struct.calcsize(HEADER_FMT)
+
+
+@app.callback(invoke_without_command=True)
+def main(
+    ctx: typer.Context,
+    version: bool = typer.Option(
+        False,
+        "--version",
+        "-v",
+        help="Show version and exit",
+    ),
+):
+    if version:
+        console.print(f"cipher {APP_VERSION}")
+        raise typer.Exit()
+
+    if ctx.invoked_subcommand is None:
+        console.print(ctx.get_help())
+        raise typer.Exit()
 
 
 def _derive_key(password: str, salt: bytes, iterations: int = PBKDF2_ITER) -> bytes:
@@ -226,15 +250,14 @@ def encrypt(
     output: Optional[Path] = typer.Option(None, "-o", "--output", help="Output file"),
     overwrite: bool = typer.Option(False, "--overwrite", help="Overwrite if destination exists"),
 ):
-    """🔒 Encrypt a file with AES-256-GCM."""
+    console.print(Panel(f"[bold]Encrypting[/bold] [cyan]{file}[/cyan]", expand=False))
+    password = _ask_password_with_strength_check()
+
     dest = output or file.with_suffix(".enc")
 
     if dest.exists() and not overwrite:
         console.print(f"[yellow]⚠ '{dest}' already exists. Use --overwrite to replace it.[/yellow]")
         raise typer.Exit(1)
-
-    console.print(Panel(f"[bold]Encrypting[/bold] [cyan]{file}[/cyan]", expand=False))
-    password = _ask_password_with_strength_check()
 
     file_size = file.stat().st_size
 
@@ -250,13 +273,7 @@ def encrypt(
         task = progress.add_task("Encrypting…", total=file_size)
         sha256 = _encrypt_stream(file, password, dest, task, progress)
 
-    table = Table(show_header=False, box=None, padding=(0, 1))
-    table.add_row("[dim]Source[/dim]", str(file), f"[dim]{_sizeof_fmt(file_size)}[/dim]")
-    table.add_row("[dim]Output[/dim]", str(dest), f"[dim]{_sizeof_fmt(dest.stat().st_size)}[/dim]")
-    table.add_row("[dim]Algorithm[/dim]", "AES-256-GCM (chunked)", "")
-    table.add_row("[dim]SHA-256[/dim]", f"[dim]{sha256[:16]}…[/dim]", "")
-    console.print(table)
-    console.print(f"\n[green]✓ File successfully encrypted → {dest}[/green]")
+    console.print(f"[green]✓ File successfully encrypted → {dest}[/green]")
 
 
 @app.command()
@@ -265,43 +282,17 @@ def decrypt(
     output: Optional[Path] = typer.Option(None, "-o", "--output", help="Output file"),
     overwrite: bool = typer.Option(False, "--overwrite", help="Overwrite if destination exists"),
 ):
-    """🔓 Decrypt a file produced by 'cipher encrypt'."""
     console.print(Panel(f"[bold]Decrypting[/bold] [cyan]{file}[/cyan]", expand=False))
     password = _ask_password(confirm=False)
 
-    file_size = file.stat().st_size
     tmp_dest = file.parent / f".{secrets.token_hex(8)}.tmp"
 
     try:
-        with Progress(
-            SpinnerColumn(),
-            TextColumn("[progress.description]{task.description}"),
-            BarColumn(),
-            FileSizeColumn(),
-            TransferSpeedColumn(),
-            console=console,
-            transient=True,
-        ) as progress:
-            task = progress.add_task("Decrypting…", total=file_size)
-            try:
-                original_name, original_size = _decrypt_stream(
-                    file, password, tmp_dest, task, progress
-                )
-            except ValueError as exc:
-                console.print(f"\n[red]✗ Failed: {exc}[/red]")
-                raise typer.Exit(1)
-
-        if output:
-            dest = output
-            if PurePath(output).suffix != PurePath(original_name).suffix:
-                console.print(
-                    f"[yellow]⚠ Original file was '{original_name}' — saving as '{output.name}' instead.[/yellow]"
-                )
-        else:
-            dest = file.parent / original_name
+        original_name, _ = _decrypt_stream(file, password, tmp_dest)
+        dest = output or file.parent / original_name
 
         if dest.exists() and not overwrite:
-            console.print(f"[yellow]⚠ '{dest}' already exists. Use --overwrite to replace it.[/yellow]")
+            console.print(f"[yellow]⚠ '{dest}' already exists.[/yellow]")
             raise typer.Exit(1)
 
         tmp_dest.rename(dest)
@@ -311,90 +302,6 @@ def decrypt(
             tmp_dest.unlink()
 
     console.print(f"[green]✓ File successfully decrypted → {dest}[/green]")
-    console.print(f"   Size: {_sizeof_fmt(dest.stat().st_size)}")
-
-
-@app.command()
-def info(
-    file: Path = typer.Argument(..., help=".enc file to inspect", exists=True),
-):
-    """ℹ️  Display metadata of an encrypted file (without decrypting it)."""
-    with open(file, "rb") as f:
-        raw = f.read(HEADER_SIZE)
-
-    if len(raw) < HEADER_SIZE:
-        console.print("[red]File too short to be a cipher file.[/red]")
-        raise typer.Exit(1)
-
-    magic, iterations, salt, base_nonce, original_size, name_len = struct.unpack(
-        HEADER_FMT, raw
-    )
-
-    if magic != MAGIC:
-        console.print("[red]This file was not produced by cipher.[/red]")
-        raise typer.Exit(1)
-
-    enc_size = file.stat().st_size
-
-    table = Table(title=f"📄 {file.name}", show_header=False, box=None, padding=(0, 2))
-    table.add_row("[bold]Format[/bold]", magic.decode())
-    table.add_row("[bold]Algorithm[/bold]", "AES-256-GCM (chunked streaming)")
-    table.add_row("[bold]KDF[/bold]", f"PBKDF2-SHA256 ({iterations:,} iterations)")
-    table.add_row("[bold]Salt (hex)[/bold]", salt.hex())
-    table.add_row("[bold]Base nonce (hex)[/bold]", base_nonce.hex())
-    table.add_row("[bold]Original size[/bold]", _sizeof_fmt(original_size))
-    table.add_row("[bold]Encrypted size[/bold]", _sizeof_fmt(enc_size))
-    table.add_row("[bold]Chunk size[/bold]", _sizeof_fmt(CHUNK_SIZE))
-    console.print(table)
-
-
-@app.command()
-def genpass(
-    length: int = typer.Option(20, "-l", "--length", help="Password length (min 16)"),
-    no_copy: bool = typer.Option(False, "--no-copy", help="Don't copy to clipboard"),
-):
-    """🎲 Generate a strong random password."""
-    if length < 16:
-        console.print("[red]Minimum length is 16 characters.[/red]")
-        raise typer.Exit(1)
-
-    alphabet = string.ascii_letters + string.digits + "!@#$%^&*-_=+?"
-
-    password = [
-        secrets.choice(string.ascii_uppercase),
-        secrets.choice(string.ascii_lowercase),
-        secrets.choice(string.digits),
-        secrets.choice("!@#$%^&*-_=+?"),
-    ]
-    password += [secrets.choice(alphabet) for _ in range(length - 4)]
-    secrets.SystemRandom().shuffle(password)
-    password = "".join(password)
-
-    entropy = math.log2(len(alphabet) ** length)
-
-    console.print(
-        Panel(f"[bold green]{password}[/bold green]", title="Generated password", expand=False)
-    )
-    console.print(
-        f"  Entropy : [cyan]{entropy:.0f} bits[/cyan]"
-        f"  |  Length : [cyan]{length}[/cyan]"
-        f"  |  Alphabet : [cyan]{len(alphabet)} chars[/cyan]"
-    )
-
-    if not no_copy:
-        try:
-            subprocess.run(["pbcopy"], input=password.encode(), check=True)
-            console.print("  [dim]✓ Copied to clipboard[/dim]")
-        except (FileNotFoundError, subprocess.CalledProcessError):
-            try:
-                subprocess.run(
-                    ["xclip", "-selection", "clipboard"],
-                    input=password.encode(),
-                    check=True,
-                )
-                console.print("  [dim]✓ Copied to clipboard[/dim]")
-            except (FileNotFoundError, subprocess.CalledProcessError):
-                console.print("  [dim]Could not copy to clipboard — paste manually.[/dim]")
 
 
 if __name__ == "__main__":
