@@ -1,6 +1,5 @@
 import hashlib
 import math
-import os
 import secrets
 import string
 import struct
@@ -8,15 +7,15 @@ import subprocess
 
 import typer
 from cryptography.hazmat.primitives import hashes
-from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 from getpass import getpass
-from pathlib import Path
+from pathlib import Path, PurePath
 from typing import Optional
 
 from rich.console import Console
 from rich.panel import Panel
-from rich.progress import BarColumn, Progress, SpinnerColumn, TextColumn
+from rich.progress import BarColumn, FileSizeColumn, Progress, SpinnerColumn, TextColumn, TransferSpeedColumn
 from rich.table import Table
 
 app = typer.Typer(
@@ -31,10 +30,9 @@ SALT_SIZE = 32
 NONCE_SIZE = 12
 PBKDF2_ITER = 480_000
 KEY_SIZE = 32
-CHUNK_SIZE = 1024 * 1024
-STREAMING_THRESHOLD = 50 * 1024 * 1024
+CHUNK_SIZE = 8 * 1024 * 1024
 
-HEADER_FMT = f">8sI{SALT_SIZE}s{NONCE_SIZE}sQ"
+HEADER_FMT = f">8sI{SALT_SIZE}s{NONCE_SIZE}sQH"
 HEADER_SIZE = struct.calcsize(HEADER_FMT)
 
 
@@ -48,110 +46,121 @@ def _derive_key(password: str, salt: bytes, iterations: int = PBKDF2_ITER) -> by
     return kdf.derive(password.encode())
 
 
-def _encrypt_data(plaintext: bytes, password: str, filename: str) -> bytes:
+def _chunk_nonce(base_nonce: bytes, counter: int) -> bytes:
+    return base_nonce[:4] + struct.pack(">Q", counter)
+
+
+def _encrypt_stream(
+    in_path: Path,
+    password: str,
+    dest: Path,
+    progress_task=None,
+    progress=None,
+) -> str:
     salt = secrets.token_bytes(SALT_SIZE)
-    nonce = secrets.token_bytes(NONCE_SIZE)
+    base_nonce = secrets.token_bytes(NONCE_SIZE)
     key = _derive_key(password, salt)
-
-    name_bytes = filename.encode()
-    payload = struct.pack(">I", len(name_bytes)) + name_bytes + plaintext
-
-    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-
     aesgcm = AESGCM(key)
-    ciphertext = aesgcm.encrypt(nonce, payload, None)
 
-    header = struct.pack(HEADER_FMT, MAGIC, PBKDF2_ITER, salt, nonce, len(plaintext))
-    return header + ciphertext
+    filename = in_path.name
+    name_bytes = filename.encode()
+    original_size = in_path.stat().st_size
 
-
-def _decrypt_data(blob: bytes, password: str) -> tuple[bytes, str]:
-    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-
-    if len(blob) < HEADER_SIZE:
-        raise ValueError("File too short or corrupted.")
-
-    magic, iterations, salt, nonce, original_size = struct.unpack(
-        HEADER_FMT, blob[:HEADER_SIZE]
+    header = struct.pack(
+        HEADER_FMT, MAGIC, PBKDF2_ITER, salt, base_nonce, original_size, len(name_bytes)
     )
 
-    if magic != MAGIC:
-        raise ValueError("This file was not encrypted by file-cipher (invalid magic).")
+    sha256 = hashlib.sha256()
+    sha256.update(header)
 
-    key = _derive_key(password, salt, iterations)
-    aesgcm = AESGCM(key)
-    ciphertext = blob[HEADER_SIZE:]
-
-    try:
-        payload = aesgcm.decrypt(nonce, ciphertext, None)
-    except Exception:
-        raise ValueError("Wrong password or file has been tampered with.")
-
-    name_len = struct.unpack(">I", payload[:4])[0]
-    filename = payload[4 : 4 + name_len].decode()
-    content = payload[4 + name_len :]
-    return content, filename
-
-
-def _encrypt_file_streaming(in_path: Path, password: str, dest: Path) -> int:
-    salt = secrets.token_bytes(SALT_SIZE)
-    nonce = secrets.token_bytes(NONCE_SIZE)
-    key = _derive_key(password, salt)
-
-    total_size = in_path.stat().st_size
-
-    header = struct.pack(HEADER_FMT, MAGIC, PBKDF2_ITER, salt, nonce, total_size)
-    dest.write_bytes(header)
-
-    ctr = 0
-    with open(in_path, "rb") as fin, open(dest, "ab") as fout:
-        while True:
-            chunk = fin.read(CHUNK_SIZE)
-            if not chunk:
-                break
-
-            counter = struct.pack(">QQ", 0, ctr)
-            ctr += 1
-
-            cipher = Cipher(algorithms.AES(key), modes.CTR(counter))
-            encryptor = cipher.encryptor()
-            encrypted_chunk = encryptor.update(chunk)
-
-            fout.write(encrypted_chunk)
-
-    return total_size
-
-
-def _decrypt_file_streaming(in_path: Path, password: str, dest: Path) -> int:
-    with open(in_path, "rb") as fin:
-        header = fin.read(HEADER_SIZE)
-        magic, iterations, salt, nonce, original_size = struct.unpack(
-            HEADER_FMT, header
-        )
-
-    if magic != MAGIC:
-        raise ValueError("This file was not encrypted by file-cipher (invalid magic).")
-
-    key = _derive_key(password, salt, iterations)
-
-    ctr = 0
     with open(in_path, "rb") as fin, open(dest, "wb") as fout:
-        fin.seek(HEADER_SIZE)
+        fout.write(header)
+
+        first_data = fin.read(CHUNK_SIZE)
+        payload = name_bytes + first_data
+        nonce = _chunk_nonce(base_nonce, 0)
+        ct = aesgcm.encrypt(nonce, payload, None)
+        size_prefix = struct.pack(">I", len(ct))
+        fout.write(size_prefix)
+        fout.write(ct)
+        sha256.update(size_prefix)
+        sha256.update(ct)
+        if progress is not None and progress_task is not None:
+            progress.update(progress_task, advance=len(first_data))
+
+        counter = 1
         while True:
             chunk = fin.read(CHUNK_SIZE)
             if not chunk:
                 break
+            nonce = _chunk_nonce(base_nonce, counter)
+            ct = aesgcm.encrypt(nonce, chunk, None)
+            size_prefix = struct.pack(">I", len(ct))
+            fout.write(size_prefix)
+            fout.write(ct)
+            sha256.update(size_prefix)
+            sha256.update(ct)
+            counter += 1
+            if progress is not None and progress_task is not None:
+                progress.update(progress_task, advance=len(chunk))
 
-            counter = struct.pack(">QQ", 0, ctr)
-            ctr += 1
+    return sha256.hexdigest()
 
-            cipher = Cipher(algorithms.AES(key), modes.CTR(counter))
-            decryptor = cipher.decryptor()
-            decrypted_chunk = decryptor.update(chunk)
 
-            fout.write(decrypted_chunk)
+def _decrypt_stream(
+    in_path: Path,
+    password: str,
+    dest: Path,
+    progress_task=None,
+    progress=None,
+) -> tuple[str, int]:
+    with open(in_path, "rb") as fin, open(dest, "wb") as fout:
+        raw_header = fin.read(HEADER_SIZE)
+        if len(raw_header) < HEADER_SIZE:
+            raise ValueError("File too short or corrupted.")
 
-    return original_size
+        magic, iterations, salt, base_nonce, original_size, name_len = struct.unpack(
+            HEADER_FMT, raw_header
+        )
+        if magic != MAGIC:
+            raise ValueError("This file was not encrypted by file-cipher (invalid magic).")
+
+        key = _derive_key(password, salt, iterations)
+        aesgcm = AESGCM(key)
+
+        original_name = None
+        counter = 0
+
+        while True:
+            size_buf = fin.read(4)
+            if not size_buf:
+                break
+            if len(size_buf) < 4:
+                raise ValueError("Truncated chunk size — file may be corrupted.")
+
+            ct_len = struct.unpack(">I", size_buf)[0]
+            ct = fin.read(ct_len)
+            if len(ct) < ct_len:
+                raise ValueError("Truncated chunk — file may be corrupted.")
+
+            nonce = _chunk_nonce(base_nonce, counter)
+            try:
+                plaintext = aesgcm.decrypt(nonce, ct, None)
+            except Exception:
+                raise ValueError("Wrong password or file has been tampered with.")
+
+            if counter == 0:
+                original_name = plaintext[:name_len].decode()
+                data = plaintext[name_len:]
+            else:
+                data = plaintext
+
+            fout.write(data)
+            counter += 1
+            if progress is not None and progress_task is not None:
+                progress.update(progress_task, advance=len(data))
+
+    return original_name, original_size
 
 
 def _ask_password(confirm: bool = False) -> str:
@@ -172,29 +181,16 @@ def _check_password_strength(password: str) -> tuple[bool, str]:
 
     if len(password) < 12:
         issues.append("too short (min 12 characters)")
-
-    has_upper = any(c.isupper() for c in password)
-    has_lower = any(c.islower() for c in password)
-    has_digit = any(c.isdigit() for c in password)
-    has_special = any(c in "!@#$%^&*-_=+?" for c in password)
-
-    if not has_upper:
+    if not any(c.isupper() for c in password):
         issues.append("no uppercase")
-    if not has_lower:
+    if not any(c.islower() for c in password):
         issues.append("no lowercase")
-    if not has_digit:
+    if not any(c.isdigit() for c in password):
         issues.append("no digit")
-    if not has_special:
+    if not any(c in "!@#$%^&*-_=+?" for c in password):
         issues.append("no special character")
 
-    common = [
-        "password",
-        "admin",
-        "123456",
-        "qwerty",
-        "letmein",
-        "welcome",
-    ]
+    common = {"password", "admin", "123456", "qwerty", "letmein", "welcome"}
     if password.lower() in common:
         issues.append("common password")
 
@@ -204,15 +200,14 @@ def _check_password_strength(password: str) -> tuple[bool, str]:
 
 
 def _ask_password_with_strength_check() -> str:
-    """Ask for a password with confirmation, then warn if weak and let user decide."""
     while True:
         password = _ask_password(confirm=True)
         strong, warning = _check_password_strength(password)
         if strong:
             return password
         console.print(f"  {warning}")
-        confirm = console.input("  [dim]Keep this password anyway? (y/n): [/dim]").strip().lower()
-        if confirm in ("y", "yes"):
+        answer = console.input("  [dim]Keep this password anyway? (y/n): [/dim]").strip().lower()
+        if answer in ("y", "yes"):
             return password
         console.print("  [dim]Please enter a new password.[/dim]")
 
@@ -229,71 +224,37 @@ def _sizeof_fmt(num: int) -> str:
 def encrypt(
     file: Path = typer.Argument(..., help="File to encrypt", exists=True),
     output: Optional[Path] = typer.Option(None, "-o", "--output", help="Output file"),
-    overwrite: bool = typer.Option(
-        False, "--overwrite", help="Overwrite if destination exists"
-    ),
+    overwrite: bool = typer.Option(False, "--overwrite", help="Overwrite if destination exists"),
 ):
     """🔒 Encrypt a file with AES-256-GCM."""
     dest = output or file.with_suffix(".enc")
 
     if dest.exists() and not overwrite:
-        console.print(
-            f"[yellow]⚠ '{dest}' already exists. Use --overwrite to replace it.[/yellow]"
-        )
+        console.print(f"[yellow]⚠ '{dest}' already exists. Use --overwrite to replace it.[/yellow]")
         raise typer.Exit(1)
 
     console.print(Panel(f"[bold]Encrypting[/bold] [cyan]{file}[/cyan]", expand=False))
     password = _ask_password_with_strength_check()
 
     file_size = file.stat().st_size
-    is_streaming = file_size > STREAMING_THRESHOLD
-
-    if is_streaming:
-        console.print(
-            f"  [dim]Large file detected - using streaming mode ({_sizeof_fmt(file_size)})[/dim]"
-        )
 
     with Progress(
         SpinnerColumn(),
         TextColumn("[progress.description]{task.description}"),
         BarColumn(),
+        FileSizeColumn(),
+        TransferSpeedColumn(),
         console=console,
         transient=True,
     ) as progress:
-        task = progress.add_task("Processing...", total=4)
-
-        if is_streaming:
-            progress.update(task, advance=1, description="Deriving key…")
-            _encrypt_file_streaming(file, password, dest)
-            progress.update(task, advance=3, description="Done!")
-        else:
-            progress.update(task, advance=1, description="Reading…")
-            plaintext = file.read_bytes()
-
-            progress.update(task, advance=1, description="Encrypting…")
-            encrypted = _encrypt_data(plaintext, password, file.name)
-
-            progress.update(task, advance=1, description="Writing…")
-            dest.write_bytes(encrypted)
-            progress.update(task, advance=1, description="Done!")
-
-    sha256 = hashlib.sha256(dest.read_bytes()).hexdigest()[:16]
+        task = progress.add_task("Encrypting…", total=file_size)
+        sha256 = _encrypt_stream(file, password, dest, task, progress)
 
     table = Table(show_header=False, box=None, padding=(0, 1))
-    table.add_row(
-        "[dim]Source[/dim]", str(file), f"[dim]{_sizeof_fmt(file.stat().st_size)}[/dim]"
-    )
-    table.add_row(
-        "[dim]Output[/dim]", str(dest), f"[dim]{_sizeof_fmt(dest.stat().st_size)}[/dim]"
-    )
-    table.add_row(
-        "[dim]Algorithm[/dim]", "AES-256-GCM" if not is_streaming else "AES-256-CTR", ""
-    )
-    table.add_row(
-        "[dim]Mode[/dim]", "In-memory" if not is_streaming else "Streaming", ""
-    )
-    table.add_row("[dim]SHA-256[/dim]", f"[dim]{sha256}…[/dim]", "")
-
+    table.add_row("[dim]Source[/dim]", str(file), f"[dim]{_sizeof_fmt(file_size)}[/dim]")
+    table.add_row("[dim]Output[/dim]", str(dest), f"[dim]{_sizeof_fmt(dest.stat().st_size)}[/dim]")
+    table.add_row("[dim]Algorithm[/dim]", "AES-256-GCM (chunked)", "")
+    table.add_row("[dim]SHA-256[/dim]", f"[dim]{sha256[:16]}…[/dim]", "")
     console.print(table)
     console.print(f"\n[green]✓ File successfully encrypted → {dest}[/green]")
 
@@ -302,95 +263,52 @@ def encrypt(
 def decrypt(
     file: Path = typer.Argument(..., help=".enc file to decrypt", exists=True),
     output: Optional[Path] = typer.Option(None, "-o", "--output", help="Output file"),
-    overwrite: bool = typer.Option(
-        False, "--overwrite", help="Overwrite if destination exists"
-    ),
+    overwrite: bool = typer.Option(False, "--overwrite", help="Overwrite if destination exists"),
 ):
     """🔓 Decrypt a file produced by 'cipher encrypt'."""
-    if output:
-        dest: Optional[Path] = output
-        if dest.exists() and not overwrite:
-            console.print(
-                f"[yellow]⚠ '{dest}' already exists. Use --overwrite to replace it.[/yellow]"
-            )
-            raise typer.Exit(1)
-    else:
-        dest = None
-
     console.print(Panel(f"[bold]Decrypting[/bold] [cyan]{file}[/cyan]", expand=False))
     password = _ask_password(confirm=False)
 
     file_size = file.stat().st_size
-    is_streaming = file_size > STREAMING_THRESHOLD
+    tmp_dest = file.parent / f".{secrets.token_hex(8)}.tmp"
 
-    if is_streaming:
-        console.print(
-            f"  [dim]Large file detected - using streaming mode ({_sizeof_fmt(file_size)})[/dim]"
-        )
-
-    with Progress(
-        SpinnerColumn(),
-        TextColumn("[progress.description]{task.description}"),
-        console=console,
-        transient=True,
-    ) as progress:
-        task = progress.add_task("Processing...", total=None)
-
-        if is_streaming:
-            progress.update(task, description="Decrypting...")
-            tmp_dest = file.parent / f".{secrets.token_hex(8)}_decrypt"
-            original_size = _decrypt_file_streaming(file, password, tmp_dest)
-
-            progress.update(task, description="Reading metadata...")
-            with open(tmp_dest, "rb") as fin:
-                data = fin.read()
-                name_len = struct.unpack(">I", data[:4])[0]
-                filename = data[4 : 4 + name_len].decode()
-                content = data[4 + name_len :]
-
-            tmp_dest.write_bytes(content)
-
-            if not output:
-                dest = file.parent / filename
-                if dest.exists() and not overwrite:
-                    console.print(
-                        f"[yellow]⚠ '{dest}' already exists. Use --overwrite to replace it.[/yellow]"
-                    )
-                    tmp_dest.unlink()
-                    raise typer.Exit(1)
-
-            tmp_dest.rename(dest)
-            actual_size = dest.stat().st_size
-
-            if actual_size != original_size:
-                console.print(
-                    f"[yellow]⚠ Size mismatch: expected {original_size}, got {actual_size}[/yellow]"
-                )
-        else:
-            progress.update(task, description="Reading...")
-            blob = file.read_bytes()
-
-            progress.update(task, description="Decrypting...")
+    try:
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(),
+            FileSizeColumn(),
+            TransferSpeedColumn(),
+            console=console,
+            transient=True,
+        ) as progress:
+            task = progress.add_task("Decrypting…", total=file_size)
             try:
-                plaintext, original_name = _decrypt_data(blob, password)
+                original_name, original_size = _decrypt_stream(
+                    file, password, tmp_dest, task, progress
+                )
             except ValueError as exc:
                 console.print(f"\n[red]✗ Failed: {exc}[/red]")
                 raise typer.Exit(1)
 
-            if not output:
-                dest = file.parent / original_name
-                if dest.exists() and not overwrite:
-                    console.print(
-                        f"[yellow]⚠ '{dest}' already exists. Use --overwrite to replace it.[/yellow]"
-                    )
-                    raise typer.Exit(1)
-            elif Path(output).suffix != Path(original_name).suffix:
+        if output:
+            dest = output
+            if PurePath(output).suffix != PurePath(original_name).suffix:
                 console.print(
                     f"[yellow]⚠ Original file was '{original_name}' — saving as '{output.name}' instead.[/yellow]"
                 )
+        else:
+            dest = file.parent / original_name
 
-            progress.update(task, description="Writing...")
-            dest.write_bytes(plaintext)
+        if dest.exists() and not overwrite:
+            console.print(f"[yellow]⚠ '{dest}' already exists. Use --overwrite to replace it.[/yellow]")
+            raise typer.Exit(1)
+
+        tmp_dest.rename(dest)
+
+    finally:
+        if tmp_dest.exists():
+            tmp_dest.unlink()
 
     console.print(f"[green]✓ File successfully decrypted → {dest}[/green]")
     console.print(f"   Size: {_sizeof_fmt(dest.stat().st_size)}")
@@ -401,38 +319,32 @@ def info(
     file: Path = typer.Argument(..., help=".enc file to inspect", exists=True),
 ):
     """ℹ️  Display metadata of an encrypted file (without decrypting it)."""
-    blob = file.read_bytes()
+    with open(file, "rb") as f:
+        raw = f.read(HEADER_SIZE)
 
-    if len(blob) < HEADER_SIZE:
+    if len(raw) < HEADER_SIZE:
         console.print("[red]File too short to be a cipher file.[/red]")
         raise typer.Exit(1)
 
-    magic, iterations, salt, nonce, original_size = struct.unpack(
-        HEADER_FMT, blob[:HEADER_SIZE]
+    magic, iterations, salt, base_nonce, original_size, name_len = struct.unpack(
+        HEADER_FMT, raw
     )
 
     if magic != MAGIC:
         console.print("[red]This file was not produced by file-cipher.[/red]")
         raise typer.Exit(1)
 
-    payload_size = len(blob) - HEADER_SIZE
-    sha256_full = hashlib.sha256(blob).hexdigest()
-    is_streaming = original_size > STREAMING_THRESHOLD
+    enc_size = file.stat().st_size
 
     table = Table(title=f"📄 {file.name}", show_header=False, box=None, padding=(0, 2))
     table.add_row("[bold]Format[/bold]", magic.decode())
-    table.add_row(
-        "[bold]Algorithm[/bold]", "AES-256-CTR" if is_streaming else "AES-256-GCM"
-    )
+    table.add_row("[bold]Algorithm[/bold]", "AES-256-GCM (chunked streaming)")
     table.add_row("[bold]KDF[/bold]", f"PBKDF2-SHA256 ({iterations:,} iterations)")
     table.add_row("[bold]Salt (hex)[/bold]", salt.hex())
-    table.add_row("[bold]Nonce (hex)[/bold]", nonce.hex())
+    table.add_row("[bold]Base nonce (hex)[/bold]", base_nonce.hex())
     table.add_row("[bold]Original size[/bold]", _sizeof_fmt(original_size))
-    table.add_row("[bold]Encrypted size[/bold]", _sizeof_fmt(len(blob)))
-    table.add_row("[bold]Payload size[/bold]", _sizeof_fmt(payload_size))
-    table.add_row("[bold]Mode[/bold]", "Streaming" if is_streaming else "In-memory")
-    table.add_row("[bold]SHA-256[/bold]", sha256_full)
-
+    table.add_row("[bold]Encrypted size[/bold]", _sizeof_fmt(enc_size))
+    table.add_row("[bold]Chunk size[/bold]", _sizeof_fmt(CHUNK_SIZE))
     console.print(table)
 
 
@@ -461,14 +373,12 @@ def genpass(
     entropy = math.log2(len(alphabet) ** length)
 
     console.print(
-        Panel(
-            f"[bold green]{password}[/bold green]",
-            title="Generated password",
-            expand=False,
-        )
+        Panel(f"[bold green]{password}[/bold green]", title="Generated password", expand=False)
     )
     console.print(
-        f"  Entropy : [cyan]{entropy:.0f} bits[/cyan]  |  Length : [cyan]{length}[/cyan]  |  Alphabet : [cyan]{len(alphabet)} chars[/cyan]"
+        f"  Entropy : [cyan]{entropy:.0f} bits[/cyan]"
+        f"  |  Length : [cyan]{length}[/cyan]"
+        f"  |  Alphabet : [cyan]{len(alphabet)} chars[/cyan]"
     )
 
     if not no_copy:
@@ -484,11 +394,8 @@ def genpass(
                 )
                 console.print("  [dim]✓ Copied to clipboard[/dim]")
             except (FileNotFoundError, subprocess.CalledProcessError):
-                console.print(
-                    "  [dim]Could not copy to clipboard — paste manually.[/dim]"
-                )
+                console.print("  [dim]Could not copy to clipboard — paste manually.[/dim]")
 
 
 if __name__ == "__main__":
     app()
-    
