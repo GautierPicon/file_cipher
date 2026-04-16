@@ -1,3 +1,4 @@
+import hashlib
 import math
 import os
 import secrets
@@ -198,8 +199,22 @@ def _check_password_strength(password: str) -> tuple[bool, str]:
         issues.append("common password")
 
     if issues:
-        return False, f"[yellow]Weak password: {', '.join(issues)}[/yellow]"
+        return False, f"[yellow]⚠ Weak password: {', '.join(issues)}[/yellow]"
     return True, ""
+
+
+def _ask_password_with_strength_check() -> str:
+    """Ask for a password with confirmation, then warn if weak and let user decide."""
+    while True:
+        password = _ask_password(confirm=True)
+        strong, warning = _check_password_strength(password)
+        if strong:
+            return password
+        console.print(f"  {warning}")
+        confirm = console.input("  [dim]Keep this password anyway? (y/n): [/dim]").strip().lower()
+        if confirm in ("y", "yes"):
+            return password
+        console.print("  [dim]Please enter a new password.[/dim]")
 
 
 def _sizeof_fmt(num: int) -> str:
@@ -228,18 +243,7 @@ def encrypt(
         raise typer.Exit(1)
 
     console.print(Panel(f"[bold]Encrypting[/bold] [cyan]{file}[/cyan]", expand=False))
-    password = _ask_password(confirm=True)
-
-    while True:
-        strong, warning = _check_password_strength(password)
-        if warning:
-            console.print(f"  {warning}")
-            confirm = console.input("  [dim]Continue anyway? (y/n): [/dim]")
-            if confirm.lower() in ("y", "yes"):
-                break
-            password = _ask_password(confirm=True)
-        else:
-            break
+    password = _ask_password_with_strength_check()
 
     file_size = file.stat().st_size
     is_streaming = file_size > STREAMING_THRESHOLD
@@ -432,9 +436,6 @@ def info(
     console.print(table)
 
 
-import hashlib
-
-
 @app.command()
 def genpass(
     length: int = typer.Option(20, "-l", "--length", help="Password length (min 16)"),
@@ -474,7 +475,7 @@ def genpass(
         try:
             subprocess.run(["pbcopy"], input=password.encode(), check=True)
             console.print("  [dim]✓ Copied to clipboard[/dim]")
-        except FileNotFoundError, subprocess.CalledProcessError:
+        except (FileNotFoundError, subprocess.CalledProcessError):
             try:
                 subprocess.run(
                     ["xclip", "-selection", "clipboard"],
@@ -482,7 +483,7 @@ def genpass(
                     check=True,
                 )
                 console.print("  [dim]✓ Copied to clipboard[/dim]")
-            except FileNotFoundError, subprocess.CalledProcessError:
+            except (FileNotFoundError, subprocess.CalledProcessError):
                 console.print(
                     "  [dim]Could not copy to clipboard — paste manually.[/dim]"
                 )
@@ -490,3 +491,4 @@ def genpass(
 
 if __name__ == "__main__":
     app()
+    
