@@ -92,12 +92,6 @@ cipher decrypt <file.enc> --overwrite
 cipher decrypt <file.enc> -o <output> --overwrite
 ```
 
-### info
-
-```bash
-cipher info <file.enc>
-```
-
 ### help
 
 ```bash
@@ -141,28 +135,6 @@ cipher decrypt secret.enc
 # Decrypt and choose a custom output name
 cipher decrypt vault.enc -o restored_report.pdf
 ```
-
-### Inspect an encrypted file (without decrypting)
-
-```bash
-cipher info secret.enc
-```
-
----
-
-## `.enc` file format
-
-```
-┌──────────────────────────────────────────────────┐
-│ MAGIC     (8 bytes)   "CIPHER01"                 │
-│ ITERATIONS(4 bytes)   PBKDF2 iteration count     │
-│ SALT      (32 bytes)  random salt                │
-│ NONCE     (12 bytes)  AES-GCM nonce              │
-│ CIPHERTEXT + TAG GCM  (rest of file)             │
-└──────────────────────────────────────────────────┘
-```
-
-The original filename is stored inside the encrypted payload — it is invisible without the password and automatically restored on decryption.
 
 ---
 
