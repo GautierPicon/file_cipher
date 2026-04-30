@@ -23,6 +23,7 @@ from cipher.password import (
     ask_password_with_strength_check,
     copy_to_clipboard,
     generate_password,
+    schedule_clipboard_clear,
 )
 
 app = typer.Typer(
@@ -36,8 +37,6 @@ app = typer.Typer(
 console = Console()
 APP_VERSION = get_version("cipher")
 
-
-# ── App callback (--version) ──────────────────────────────────────────────────
 
 @app.callback(invoke_without_command=True)
 def main(
@@ -58,8 +57,6 @@ def main(
         raise typer.Exit()
 
 
-# ── encrypt ───────────────────────────────────────────────────────────────────
-
 @app.command()
 def encrypt(
     file: Path = typer.Argument(..., help="File or folder to encrypt", exists=True),
@@ -77,10 +74,12 @@ def encrypt(
     if genpass:
         password = generate_password()
         clipboard_ok = copy_to_clipboard(password)
+        if clipboard_ok:
+            schedule_clipboard_clear(delay=30)
     else:
         password = ask_password_with_strength_check()
 
-    dest = output or Path(str(file).rstrip("/") + ".enc")
+    dest = output or (file.with_suffix(".enc") if not is_dir else Path(str(file).rstrip("/") + ".enc"))
 
     if dest.exists() and not overwrite:
         console.print(f"[yellow]⚠ '{dest}' already exists. Use --overwrite to replace it.[/yellow]")
@@ -109,7 +108,7 @@ def encrypt(
 
     if genpass:
         clipboard_note = (
-            "\n[dim]📋 Copied to clipboard.[/dim]"
+            "\n[dim]📋 Copied to clipboard — cleared in 30 s.[/dim]"
             if clipboard_ok
             else "\n[dim]Could not copy to clipboard.[/dim]"
         )
@@ -126,8 +125,6 @@ def encrypt(
         )
 
 
-# ── decrypt ───────────────────────────────────────────────────────────────────
-
 @app.command()
 def decrypt(
     file: Path = typer.Argument(..., help=".enc file to decrypt", exists=True),
@@ -140,14 +137,12 @@ def decrypt(
     tmp_dest = file.parent / f".{secrets.token_hex(8)}.tmp"
 
     try:
-        # ── Step 1: decrypt ciphertext into a temporary file ──────────────
         try:
             original_name, _ = decrypt_stream(file, password, tmp_dest)
         except ValueError as e:
             console.print(f"[red]✗ {e}[/red]")
             raise typer.Exit(1)
 
-        # ── Step 2: move / extract to final destination ───────────────────
         is_tar = original_name.endswith(".tar.gz")
 
         if is_tar:
@@ -160,7 +155,12 @@ def decrypt(
                 )
                 raise typer.Exit(1)
 
+            extract_root = file.parent.resolve()
             with tarfile.open(tmp_dest, "r:gz") as tar:
+                for member in tar.getmembers():
+                    member_path = (extract_root / member.name).resolve()
+                    if not str(member_path).startswith(str(extract_root)):
+                        raise ValueError(f"Unsafe path in archive: {member.name}")
                 tar.extractall(path=file.parent, filter="data")
 
             extracted = file.parent / folder_name

@@ -1,6 +1,7 @@
 import secrets
 import string
 import subprocess
+import threading
 
 from getpass import getpass
 
@@ -10,10 +11,7 @@ from rich.console import Console
 console = Console()
 
 
-# ── Generation ────────────────────────────────────────────────────────────────
-
 def generate_password(length: int = 32) -> str:
-    """Generate a cryptographically strong random password."""
     alphabet = string.ascii_letters + string.digits + "!@#$%^&*-_=+?"
     required = [
         secrets.choice(string.ascii_uppercase),
@@ -28,7 +26,6 @@ def generate_password(length: int = 32) -> str:
 
 
 def copy_to_clipboard(text: str) -> bool:
-    """Try to copy text to the system clipboard. Returns True on success."""
     for cmd in [
         ["pbcopy"],
         ["xclip", "-selection", "clipboard"],
@@ -42,10 +39,16 @@ def copy_to_clipboard(text: str) -> bool:
     return False
 
 
-# ── Strength check ────────────────────────────────────────────────────────────
+def schedule_clipboard_clear(delay: int = 30) -> None:
+    def _clear() -> None:
+        copy_to_clipboard("")
+
+    t = threading.Timer(delay, _clear)
+    t.daemon = True
+    t.start()
+
 
 def check_password_strength(password: str) -> tuple[bool, str]:
-    """Return (is_strong, warning_message)."""
     issues = []
 
     if len(password) < 12:
@@ -68,10 +71,7 @@ def check_password_strength(password: str) -> tuple[bool, str]:
     return True, ""
 
 
-# ── Interactive prompts ───────────────────────────────────────────────────────
-
 def ask_password(confirm: bool = False) -> str:
-    """Prompt the user for a password, with optional confirmation."""
     pwd = getpass("🔑 Password: ")
     if not pwd:
         console.print("[red]Password cannot be empty.[/red]")
@@ -85,7 +85,6 @@ def ask_password(confirm: bool = False) -> str:
 
 
 def ask_password_with_strength_check() -> str:
-    """Prompt for a password, enforce strength, and allow the user to override."""
     while True:
         password = ask_password(confirm=True)
         strong, warning = check_password_strength(password)
