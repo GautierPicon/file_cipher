@@ -63,6 +63,12 @@ uv sync
 uv run cipher --help
 ```
 
+### Test your changes
+
+```bash
+uv run pytest
+```
+
 ### Build the wheel locally
 
 ```bash
@@ -160,10 +166,6 @@ change in a future version.
 Chunks are encrypted individually with AES-256-GCM. Each chunk has its own
 nonce derived from the base nonce, so a truncated or reordered file is
 detected immediately. The filename is authenticated inside the first chunk.
-
-> ⚠ **Format compatibility** — files encrypted with cipher < 1.0.0 (format
-> `CIPHER01`, PBKDF2-SHA256) cannot be decrypted by this version. Re-encrypt
-> them after upgrading.
 
 ---
 
