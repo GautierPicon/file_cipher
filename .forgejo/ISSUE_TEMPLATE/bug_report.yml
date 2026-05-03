@@ -1,0 +1,32 @@
+name: Bug report
+about: Something isn't working as expected
+labels: ["bug"]
+body:
+  - type: textarea
+    id: description
+    attributes:
+      label: What happened?
+      description: Describe the bug and what you expected instead.
+      placeholder: "I ran `cipher encrypt file.txt` and got…"
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. 
+        2. 
+        3.
+    validations:
+      required: true
+
+  - type: input
+    id: env
+    attributes:
+      label: Environment
+      description: OS and cipher version
+      placeholder: "Ubuntu 24.04, cipher 1.2.0"
+    validations:
+      required: true
