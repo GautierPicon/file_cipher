@@ -10,6 +10,7 @@ on:
 jobs:
   check-and-release:
     runs-on: codeberg-tiny
+
     permissions:
       contents: write
 
@@ -52,10 +53,17 @@ jobs:
         if: steps.tag_check.outputs.exists == 'false'
         run: |
           LAST_TAG=$(git tag --sort=-version:refname | head -1)
+
           if [ -z "$LAST_TAG" ]; then
-            COMMITS=$(git log --pretty=format:"- %s" HEAD)
+            COMMITS=$(git log --pretty=format:"- %s" HEAD \
+              --invert-grep --grep='^bump:')
           else
-            COMMITS=$(git log --pretty=format:"- %s" "$LAST_TAG"..HEAD)
+            COMMITS=$(git log --pretty=format:"- %s" "$LAST_TAG"..HEAD \
+              --invert-grep --grep='^bump:')
+          fi
+
+          if [ -z "$COMMITS" ]; then
+            COMMITS="- No user-facing changes"
           fi
 
           cat > /tmp/release_notes.md << NOTES
@@ -82,15 +90,16 @@ jobs:
 
           echo "Creating tag $TAG..."
 
-          # Crée le tag
+          # Create tag
           curl -s -o /tmp/tag_response.json -w "Tag HTTP: %{http_code}\n" \
             -X POST "$API/repos/$REPO/tags" \
             -H "Authorization: token $TOKEN" \
             -H "Content-Type: application/json" \
             -d "{\"tag_name\": \"$TAG\", \"message\": \"Release $TAG\"}"
+
           cat /tmp/tag_response.json
 
-          # Crée la release
+          # Create release
           RELEASE_BODY=$(python3 -c "import json; print(json.dumps(open('/tmp/release_notes.md').read()))")
 
           curl -s -o /tmp/release_response.json -w "Release HTTP: %{http_code}\n" \
@@ -98,24 +107,28 @@ jobs:
             -H "Authorization: token $TOKEN" \
             -H "Content-Type: application/json" \
             -d "{\"tag_name\": \"$TAG\", \"name\": \"$TAG\", \"body\": $RELEASE_BODY, \"draft\": false, \"prerelease\": false}"
+
           cat /tmp/release_response.json
 
           RELEASE_ID=$(python3 -c "
           import json, sys
           data = json.load(open('/tmp/release_response.json'))
+
           if 'id' not in data:
               print('ERROR:', data, file=sys.stderr)
               sys.exit(1)
+
           print(data['id'])
           ")
 
           echo "Release id: $RELEASE_ID"
 
-          # Upload les assets
+          # Upload wheel
           curl -s -X POST "$API/repos/$REPO/releases/$RELEASE_ID/assets" \
             -H "Authorization: token $TOKEN" \
             -F "attachment=@$(ls dist/*.whl)"
 
+          # Upload source archive
           curl -s -X POST "$API/repos/$REPO/releases/$RELEASE_ID/assets" \
             -H "Authorization: token $TOKEN" \
             -F "attachment=@$(ls dist/*.tar.gz)"
