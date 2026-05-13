@@ -83,7 +83,7 @@ uv build
 ### encrypt
 
 ```bash
-cipher encrypt <file>
+cipher encrypt <file> [<file2> ...]
 cipher encrypt <file> --genpass
 cipher encrypt <file> -o <output>
 cipher encrypt <file> --overwrite
@@ -99,12 +99,19 @@ cipher decrypt <file.enc> --overwrite
 cipher decrypt <file.enc> -o <output> --overwrite
 ```
 
+### verify
+
+```bash
+cipher verify <file.enc>
+```
+
 ### help
 
 ```bash
 cipher --help
 cipher encrypt --help
 cipher decrypt --help
+cipher verify --help
 ```
 
 ---
@@ -124,6 +131,18 @@ cipher encrypt rapport.pdf -o vault.enc
 cipher encrypt my-folder/
 ```
 
+### Encrypt multiple files at once
+
+```bash
+# Encrypt several files in one command — one password prompt for all
+cipher encrypt file1.txt file2.pdf my-folder/
+
+# With --overwrite if the .enc files already exist
+cipher encrypt file1.txt file2.pdf --overwrite
+```
+
+> `-o` / `--output` cannot be used when encrypting multiple files.
+
 ### Encrypt with a generated password
 
 ```bash
@@ -142,6 +161,33 @@ cipher decrypt secret.enc
 # Decrypt and choose a custom output name
 cipher decrypt vault.enc -o restored_report.pdf
 ```
+
+### Verify a file
+
+```bash
+# Verify integrity and password without writing anything to disk
+cipher verify secret.enc
+```
+
+`verify` decrypts every chunk in memory and checks the AES-GCM authentication tag. It confirms that:
+- the password is correct,
+- the file has not been tampered with or truncated.
+
+No output file is ever created.
+
+---
+
+## Platform support
+
+cipher runs on **macOS, Linux, and Windows**.
+
+| Feature | macOS | Linux | Windows |
+|---|---|---|---|
+| Encryption / Decryption | ✓ | ✓ | ✓ |
+| Verify | ✓ | ✓ | ✓ |
+| Clipboard (`--genpass`) | `pbcopy` | `xclip` / `xsel` / `wl-copy` | `clip` |
+| File permissions (`chmod 600`) | ✓ | ✓ | skipped (no-op on NTFS) |
+| Directory encryption | pipe | pipe | temp file (pipes are blocking on Windows) |
 
 ---
 
