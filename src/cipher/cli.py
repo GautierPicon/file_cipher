@@ -4,7 +4,7 @@ import tarfile
 import typer
 from importlib.metadata import version as get_version
 from pathlib import Path
-from typing import Optional
+from typing import List, Optional
 
 from rich.console import Console
 from rich.panel import Panel
@@ -59,17 +59,17 @@ def main(
 
 @app.command()
 def encrypt(
-    file: Path = typer.Argument(..., help="File or folder to encrypt", exists=True),
-    output: Optional[Path] = typer.Option(None, "-o", "--output", help="Output file"),
+    files: List[Path] = typer.Argument(..., help="Files or folders to encrypt", exists=True),
+    output: Optional[Path] = typer.Option(
+        None, "-o", "--output",
+        help="Output file (only valid when encrypting a single input)",
+    ),
     overwrite: bool = typer.Option(False, "--overwrite", help="Overwrite if destination exists"),
     genpass: bool = typer.Option(False, "--genpass", help="Generate a strong random password"),
 ):
-    is_dir = file.is_dir()
-    label = "folder" if is_dir else "file"
-    console.print(Panel(
-        f"[bold]Encrypting[/bold] [cyan]{file}[/cyan] [dim]({label})[/dim]",
-        expand=False,
-    ))
+    if output is not None and len(files) > 1:
+        console.print("[red]✗ --output / -o cannot be used with multiple input files.[/red]")
+        raise typer.Exit(1)
 
     if genpass:
         password = generate_password()
@@ -79,32 +79,53 @@ def encrypt(
     else:
         password = ask_password_with_strength_check()
 
-    dest = output or (file.with_suffix(".enc") if not is_dir else Path(str(file).rstrip("/") + ".enc"))
+    errors: list[str] = []
 
-    if dest.exists() and not overwrite:
-        console.print(f"[yellow]⚠ '{dest}' already exists. Use --overwrite to replace it.[/yellow]")
-        raise typer.Exit(1)
+    for file in files:
+        is_dir = file.is_dir()
+        label = "folder" if is_dir else "file"
 
-    file_size = (
-        sum(f.stat().st_size for f in file.rglob("*") if f.is_file())
-        if is_dir
-        else file.stat().st_size
-    )
+        console.print(Panel(
+            f"[bold]Encrypting[/bold] [cyan]{file}[/cyan] [dim]({label})[/dim]",
+            expand=False,
+        ))
 
-    with Progress(
-        SpinnerColumn(),
-        TextColumn("[progress.description]{task.description}"),
-        BarColumn(),
-        FileSizeColumn(),
-        TransferSpeedColumn(),
-        console=console,
-        transient=True,
-    ) as progress:
-        task = progress.add_task("Encrypting…", total=file_size)
-        sha256 = encrypt_stream(file, password, dest, task, progress)
+        dest = output or (
+            file.with_suffix(".enc") if not is_dir
+            else Path(str(file).rstrip("/") + ".enc")
+        )
 
-    console.print(f"[green]✓ {label.capitalize()} successfully encrypted → {dest}[/green]")
-    console.print(f"[dim]SHA-256: {sha256}[/dim]")
+        if dest.exists() and not overwrite:
+            msg = f"[yellow]⚠ '{dest}' already exists. Use --overwrite to replace it.[/yellow]"
+            console.print(msg)
+            errors.append(str(file))
+            continue
+
+        file_size = (
+            sum(f.stat().st_size for f in file.rglob("*") if f.is_file())
+            if is_dir
+            else file.stat().st_size
+        )
+
+        try:
+            with Progress(
+                SpinnerColumn(),
+                TextColumn("[progress.description]{task.description}"),
+                BarColumn(),
+                FileSizeColumn(),
+                TransferSpeedColumn(),
+                console=console,
+                transient=True,
+            ) as progress:
+                task = progress.add_task("Encrypting…", total=file_size)
+                sha256 = encrypt_stream(file, password, dest, task, progress)
+
+            console.print(f"[green]✓ {label.capitalize()} successfully encrypted → {dest}[/green]")
+            console.print(f"[dim]SHA-256: {sha256}[/dim]")
+
+        except Exception as exc:
+            console.print(f"[red]✗ Failed to encrypt '{file}': {exc}[/red]")
+            errors.append(str(file))
 
     if genpass:
         clipboard_note = (
@@ -123,6 +144,10 @@ def encrypt(
                 expand=False,
             )
         )
+
+    if errors:
+        console.print(f"\n[red]✗ {len(errors)} file(s) failed:[/red] {', '.join(errors)}")
+        raise typer.Exit(1)
 
 
 @app.command()

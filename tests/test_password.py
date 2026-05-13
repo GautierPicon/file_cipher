@@ -4,7 +4,7 @@ def test_generated_password_length():
     assert len(generate_password()) == 32
 
 def test_generated_password_is_strong():
-    for _ in range(20):  # plusieurs fois car il y a de l'aléatoire
+    for _ in range(20):
         pwd = generate_password()
         ok, _ = check_password_strength(pwd)
         assert ok, f"Mot de passe généré trop faible : {pwd}"

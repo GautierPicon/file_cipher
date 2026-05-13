@@ -2,8 +2,6 @@ import pytest
 from pathlib import Path
 from cipher.crypto import encrypt_stream, decrypt_stream, derive_key, chunk_nonce
 
-# ── Clé et nonce ──────────────────────────────────────────────────────────────
-
 def test_derive_key_is_deterministic():
     salt = b"a" * 32
     k1 = derive_key("password", salt)
@@ -22,8 +20,6 @@ def test_chunk_nonce_length():
 def test_chunk_nonce_counter_changes_nonce():
     base = b"\x00" * 12
     assert chunk_nonce(base, 0) != chunk_nonce(base, 1)
-
-# ── Encrypt / Decrypt round-trip ──────────────────────────────────────────────
 
 def test_roundtrip_file(tmp_path):
     src = tmp_path / "hello.txt"
@@ -60,8 +56,6 @@ def test_roundtrip_binary_file(tmp_path):
 
     assert dec.read_bytes() == data
 
-# ── Mauvais mot de passe ───────────────────────────────────────────────────────
-
 def test_wrong_password_raises(tmp_path):
     src = tmp_path / "secret.txt"
     src.write_bytes(b"sensitive data")
@@ -73,8 +67,6 @@ def test_wrong_password_raises(tmp_path):
     with pytest.raises(ValueError, match="Wrong password"):
         decrypt_stream(enc, "WrongPass1!", dec)
 
-# ── Intégrité ─────────────────────────────────────────────────────────────────
-
 def test_tampered_file_raises(tmp_path):
     src = tmp_path / "data.txt"
     src.write_bytes(b"important data")
@@ -83,7 +75,6 @@ def test_tampered_file_raises(tmp_path):
 
     encrypt_stream(src, "StrongPass1!", enc)
 
-    # Flip quelques octets au milieu du fichier
     raw = bytearray(enc.read_bytes())
     mid = len(raw) // 2
     raw[mid] ^= 0xFF
@@ -99,12 +90,10 @@ def test_truncated_file_raises(tmp_path):
     dec = tmp_path / "data_dec.txt"
 
     encrypt_stream(src, "StrongPass1!", enc)
-    enc.write_bytes(enc.read_bytes()[:30])  # tronqué
+    enc.write_bytes(enc.read_bytes()[:30])
 
     with pytest.raises(ValueError):
         decrypt_stream(enc, "StrongPass1!", dec)
-
-# ── Dossier ───────────────────────────────────────────────────────────────────
 
 def test_roundtrip_directory(tmp_path):
     folder = tmp_path / "my_folder"
