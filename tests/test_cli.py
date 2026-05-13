@@ -31,6 +31,12 @@ def _decrypt(enc: Path, *extra_args, password=PASSWORD):
         return runner.invoke(app, ["decrypt", str(enc), *extra_args])
 
 
+def _verify(enc: Path, password=PASSWORD):
+    """Run `cipher verify <enc>` with a mocked password."""
+    with patch(PATCH_ASK, return_value=password):
+        return runner.invoke(app, ["verify", str(enc)])
+
+
 class TestEncryptSingleFile:
     def test_creates_enc_file(self, tmp_path):
         src = tmp_path / "hello.txt"
@@ -236,3 +242,65 @@ class TestDecrypt:
         enc = tmp_path / "data.enc"
         result = _decrypt(enc, "--overwrite")
         assert result.exit_code == 0
+
+
+class TestVerify:
+    def test_valid_file_exits_zero(self, tmp_path):
+        src = tmp_path / "doc.txt"
+        src.write_bytes(b"important")
+        _encrypt(tmp_path, files=[src])
+        result = _verify(tmp_path / "doc.enc")
+        assert result.exit_code == 0
+
+    def test_output_contains_original_filename(self, tmp_path):
+        src = tmp_path / "report.pdf"
+        src.write_bytes(b"pdf content")
+        _encrypt(tmp_path, files=[src])
+        result = _verify(tmp_path / "report.enc")
+        assert "report.pdf" in result.output
+
+    def test_wrong_password_exits_nonzero(self, tmp_path):
+        src = tmp_path / "secret.txt"
+        src.write_bytes(b"data")
+        _encrypt(tmp_path, files=[src])
+        result = _verify(tmp_path / "secret.enc", password="WrongPass1!")
+        assert result.exit_code == 1
+        assert "Wrong password" in result.output
+
+    def test_tampered_file_exits_nonzero(self, tmp_path):
+        src = tmp_path / "data.txt"
+        src.write_bytes(b"data")
+        _encrypt(tmp_path, files=[src])
+        enc = tmp_path / "data.enc"
+        raw = bytearray(enc.read_bytes())
+        raw[len(raw) // 2] ^= 0xFF
+        enc.write_bytes(bytes(raw))
+        result = _verify(enc)
+        assert result.exit_code == 1
+
+    def test_truncated_file_exits_nonzero(self, tmp_path):
+        src = tmp_path / "data.txt"
+        src.write_bytes(b"data")
+        _encrypt(tmp_path, files=[src])
+        enc = tmp_path / "data.enc"
+        enc.write_bytes(enc.read_bytes()[:30])
+        result = _verify(enc)
+        assert result.exit_code == 1
+
+    def test_no_output_file_written(self, tmp_path):
+        src = tmp_path / "clean.txt"
+        src.write_bytes(b"clean")
+        _encrypt(tmp_path, files=[src])
+        before = set(tmp_path.iterdir())
+        _verify(tmp_path / "clean.enc")
+        after = set(tmp_path.iterdir())
+        assert before == after
+
+    def test_verify_folder_enc(self, tmp_path):
+        folder = tmp_path / "myfolder"
+        folder.mkdir()
+        (folder / "a.txt").write_bytes(b"a")
+        _encrypt(tmp_path, files=[folder])
+        result = _verify(tmp_path / "myfolder.enc")
+        assert result.exit_code == 0
+        assert "myfolder.tar.gz" in result.output

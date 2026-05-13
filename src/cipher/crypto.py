@@ -248,6 +248,68 @@ def decrypt_stream(
     return original_name, original_size
 
 
+def verify_stream(in_path: Path, password: str) -> tuple[str, int]:
+    with open(in_path, "rb") as fin:
+        raw_header = fin.read(HEADER_SIZE)
+        if len(raw_header) < HEADER_SIZE:
+            raise ValueError("File too short or corrupted.")
+
+        magic, time_cost, memory_cost, parallelism, salt, base_nonce, original_size, name_len = (
+            struct.unpack(HEADER_FMT, raw_header)
+        )
+
+        if not hmac.compare_digest(magic, MAGIC):
+            raise ValueError("This file was not encrypted by cipher (invalid magic).")
+
+        if name_len == 0 or name_len > MAX_NAME_LEN:
+            raise ValueError(f"Invalid filename length in header ({name_len}).")
+
+        key = derive_key(password, salt, time_cost, memory_cost, parallelism)
+        aesgcm = AESGCM(key)
+
+        original_name: str | None = None
+        counter = 0
+
+        while True:
+            size_buf = fin.read(4)
+            if not size_buf:
+                break
+            if len(size_buf) < 4:
+                raise ValueError("Truncated chunk size — file may be corrupted.")
+
+            raw_size = struct.unpack(">I", size_buf)[0]
+            is_padding = bool(raw_size & PADDING_FLAG)
+            ct_len = raw_size & ~PADDING_FLAG
+
+            if ct_len > MAX_CT_SIZE:
+                raise ValueError("Chunk size exceeds maximum — file may be corrupted.")
+
+            ct = fin.read(ct_len)
+            if len(ct) < ct_len:
+                raise ValueError("Truncated chunk — file may be corrupted.")
+
+            nonce = chunk_nonce(base_nonce, counter)
+            try:
+                plaintext = aesgcm.decrypt(nonce, ct, None)
+            except Exception:
+                raise ValueError("Wrong password or file has been tampered with.")
+
+            if is_padding:
+                break
+
+            if counter == 0:
+                if name_len > len(plaintext):
+                    raise ValueError("Corrupted header: name_len exceeds first chunk size.")
+                original_name = plaintext[:name_len].decode()
+
+            counter += 1
+
+    if original_name is None:
+        raise ValueError("File contains no chunks — file may be corrupted.")
+
+    return original_name, original_size
+
+
 def _open_tar_pipe(path: Path) -> tuple[io.RawIOBase, threading.Thread, queue.Queue]:
     r_fd, w_fd = os.pipe()
     error_queue: queue.Queue = queue.Queue()

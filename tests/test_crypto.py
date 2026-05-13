@@ -1,6 +1,6 @@
 import pytest
 from pathlib import Path
-from cipher.crypto import encrypt_stream, decrypt_stream, derive_key, chunk_nonce
+from cipher.crypto import encrypt_stream, decrypt_stream, derive_key, chunk_nonce, verify_stream
 
 def test_derive_key_is_deterministic():
     salt = b"a" * 32
@@ -108,3 +108,82 @@ def test_roundtrip_directory(tmp_path):
     name, _ = decrypt_stream(enc, "StrongPass1!", out_dir / "my_folder.tar.gz")
 
     assert name == "my_folder.tar.gz"
+
+
+class TestVerifyStream:
+    def test_valid_returns_original_name(self, tmp_path):
+        src = tmp_path / "hello.txt"
+        src.write_bytes(b"Hello!")
+        enc = tmp_path / "hello.enc"
+        encrypt_stream(src, "StrongPass1!", enc)
+        name, _ = verify_stream(enc, "StrongPass1!")
+        assert name == "hello.txt"
+
+    def test_valid_empty_file(self, tmp_path):
+        src = tmp_path / "empty.txt"
+        src.write_bytes(b"")
+        enc = tmp_path / "empty.enc"
+        encrypt_stream(src, "StrongPass1!", enc)
+        name, _ = verify_stream(enc, "StrongPass1!")
+        assert name == "empty.txt"
+
+    def test_valid_binary_file(self, tmp_path):
+        src = tmp_path / "binary.bin"
+        src.write_bytes(bytes(range(256)) * 100)
+        enc = tmp_path / "binary.enc"
+        encrypt_stream(src, "StrongPass1!", enc)
+        name, _ = verify_stream(enc, "StrongPass1!")
+        assert name == "binary.bin"
+
+    def test_wrong_password_raises(self, tmp_path):
+        src = tmp_path / "secret.txt"
+        src.write_bytes(b"data")
+        enc = tmp_path / "secret.enc"
+        encrypt_stream(src, "CorrectPass1!", enc)
+        with pytest.raises(ValueError, match="Wrong password"):
+            verify_stream(enc, "WrongPass1!")
+
+    def test_tampered_file_raises(self, tmp_path):
+        src = tmp_path / "data.txt"
+        src.write_bytes(b"important")
+        enc = tmp_path / "data.enc"
+        encrypt_stream(src, "StrongPass1!", enc)
+        raw = bytearray(enc.read_bytes())
+        raw[len(raw) // 2] ^= 0xFF
+        enc.write_bytes(bytes(raw))
+        with pytest.raises(ValueError):
+            verify_stream(enc, "StrongPass1!")
+
+    def test_truncated_file_raises(self, tmp_path):
+        src = tmp_path / "data.txt"
+        src.write_bytes(b"important")
+        enc = tmp_path / "data.enc"
+        encrypt_stream(src, "StrongPass1!", enc)
+        enc.write_bytes(enc.read_bytes()[:30])
+        with pytest.raises(ValueError):
+            verify_stream(enc, "StrongPass1!")
+
+    def test_does_not_write_any_file(self, tmp_path):
+        src = tmp_path / "clean.txt"
+        src.write_bytes(b"clean data")
+        enc = tmp_path / "clean.enc"
+        encrypt_stream(src, "StrongPass1!", enc)
+        before = set(tmp_path.iterdir())
+        verify_stream(enc, "StrongPass1!")
+        after = set(tmp_path.iterdir())
+        assert before == after
+
+    def test_directory_enc_returns_tar_name(self, tmp_path):
+        folder = tmp_path / "myfolder"
+        folder.mkdir()
+        (folder / "f.txt").write_bytes(b"content")
+        enc = tmp_path / "myfolder.enc"
+        encrypt_stream(folder, "StrongPass1!", enc)
+        name, _ = verify_stream(enc, "StrongPass1!")
+        assert name == "myfolder.tar.gz"
+
+    def test_invalid_magic_raises(self, tmp_path):
+        enc = tmp_path / "fake.enc"
+        enc.write_bytes(b"\x00" * 200)
+        with pytest.raises(ValueError, match="invalid magic"):
+            verify_stream(enc, "StrongPass1!")

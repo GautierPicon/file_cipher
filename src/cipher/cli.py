@@ -17,7 +17,7 @@ from rich.progress import (
     TransferSpeedColumn,
 )
 
-from cipher.crypto import encrypt_stream, decrypt_stream
+from cipher.crypto import encrypt_stream, decrypt_stream, verify_stream
 from cipher.password import (
     ask_password,
     ask_password_with_strength_check,
@@ -209,6 +209,22 @@ def decrypt(
     finally:
         if tmp_dest.exists():
             tmp_dest.unlink()
+
+
+@app.command()
+def verify(
+    file: Path = typer.Argument(..., help=".enc file to verify", exists=True),
+):
+    console.print(Panel(f"[bold]Verifying[/bold] [cyan]{file}[/cyan]", expand=False))
+    password = ask_password(confirm=False)
+
+    try:
+        original_name, _ = verify_stream(file, password)
+    except ValueError as e:
+        console.print(f"[red]✗ {e}[/red]")
+        raise typer.Exit(1)
+
+    console.print(f"[green]✓ Integrity verified — original filename: {original_name}[/green]")
 
 
 if __name__ == "__main__":
