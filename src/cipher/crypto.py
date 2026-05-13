@@ -5,7 +5,9 @@ import os
 import queue
 import struct
 import secrets
+import sys
 import tarfile
+import tempfile
 import threading
 
 from argon2.low_level import hash_secret_raw, Type as Argon2Type
@@ -31,6 +33,8 @@ MAX_NAME_LEN = 255
 MAX_CT_SIZE = CHUNK_SIZE + 512
 
 FIXED_MTIME = 0
+
+_WINDOWS = sys.platform == "win32"
 
 
 def derive_key(
@@ -62,7 +66,8 @@ def _pad_size(current_size: int) -> int:
 
 def _neutralize_metadata(path: Path) -> None:
     os.utime(path, (FIXED_MTIME, FIXED_MTIME))
-    path.chmod(0o600)
+    if not _WINDOWS:
+        path.chmod(0o600)
 
 
 def encrypt_stream(
@@ -81,7 +86,7 @@ def encrypt_stream(
 
     if is_dir:
         filename = in_path.name + ".tar.gz"
-        data_source, tar_thread, error_queue = _open_tar_pipe(in_path)
+        data_source, tar_thread, error_queue = _open_tar_source(in_path)
         original_size = 0
     else:
         filename = in_path.name
@@ -161,7 +166,7 @@ def encrypt_stream(
         raise
     finally:
         data_source.close()
-        if tar_thread is not None:
+        if tar_thread is not None and tar_thread.is_alive():
             tar_thread.join()
 
     if error_queue is not None and not error_queue.empty():
@@ -310,7 +315,13 @@ def verify_stream(in_path: Path, password: str) -> tuple[str, int]:
     return original_name, original_size
 
 
-def _open_tar_pipe(path: Path) -> tuple[io.RawIOBase, threading.Thread, queue.Queue]:
+def _open_tar_source(path: Path) -> tuple[io.RawIOBase, threading.Thread, queue.Queue]:
+    if _WINDOWS:
+        return _open_tar_source_tempfile(path)
+    return _open_tar_source_pipe(path)
+
+
+def _open_tar_source_pipe(path: Path) -> tuple[io.RawIOBase, threading.Thread, queue.Queue]:
     r_fd, w_fd = os.pipe()
     error_queue: queue.Queue = queue.Queue()
 
@@ -325,3 +336,41 @@ def _open_tar_pipe(path: Path) -> tuple[io.RawIOBase, threading.Thread, queue.Qu
     thread = threading.Thread(target=_produce, daemon=True)
     thread.start()
     return os.fdopen(r_fd, "rb"), thread, error_queue
+
+
+def _open_tar_source_tempfile(path: Path) -> tuple[io.RawIOBase, None, queue.Queue]:
+    error_queue: queue.Queue = queue.Queue()
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".tar.gz")
+    tmp_path = Path(tmp.name)
+    tmp.close()
+
+    try:
+        with tarfile.open(tmp_path, mode="w:gz") as tar:
+            tar.add(path, arcname=path.name)
+    except Exception as exc:
+        tmp_path.unlink(missing_ok=True)
+        error_queue.put(exc)
+        raise
+
+    class _SelfCleaningFile(io.RawIOBase):
+        def __init__(self) -> None:
+            self._fh = open(tmp_path, "rb")
+
+        def readinto(self, b: bytearray) -> int:
+            return self._fh.readinto(b)
+
+        def read(self, size: int = -1) -> bytes:
+            return self._fh.read(size)
+
+        def readable(self) -> bool:
+            return True
+
+        def close(self) -> None:
+            if not self.closed:
+                try:
+                    self._fh.close()
+                finally:
+                    tmp_path.unlink(missing_ok=True)
+                    super().close()
+
+    return _SelfCleaningFile(), None, error_queue

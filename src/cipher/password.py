@@ -1,6 +1,7 @@
 import secrets
 import string
 import subprocess
+import sys
 import threading
 
 from getpass import getpass
@@ -26,13 +27,27 @@ def generate_password(length: int = 32) -> str:
 
 
 def copy_to_clipboard(text: str) -> bool:
-    for cmd in [
-        ["pbcopy"],
-        ["xclip", "-selection", "clipboard"],
-        ["xsel", "--clipboard", "--input"],
-    ]:
+    _CLIPBOARD_COMMANDS: list[list[str]]
+
+    if sys.platform == "win32":
+        _CLIPBOARD_COMMANDS = [["clip"]]
+    elif sys.platform == "darwin":
+        _CLIPBOARD_COMMANDS = [["pbcopy"]]
+    else:
+        _CLIPBOARD_COMMANDS = [
+            ["xclip", "-selection", "clipboard"],
+            ["xsel", "--clipboard", "--input"],
+            ["wl-copy"],
+        ]
+
+    for cmd in _CLIPBOARD_COMMANDS:
         try:
-            subprocess.run(cmd, input=text.encode(), check=True, capture_output=True)
+            subprocess.run(
+                cmd,
+                input=text.encode(),
+                check=True,
+                capture_output=True,
+            )
             return True
         except (FileNotFoundError, subprocess.CalledProcessError):
             continue
