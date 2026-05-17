@@ -9,6 +9,7 @@ import sys
 import tarfile
 import tempfile
 import threading
+from typing import Iterator
 
 from argon2.low_level import hash_secret_raw, Type as Argon2Type
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
@@ -32,10 +33,40 @@ HEADER_SIZE = struct.calcsize(HEADER_FMT)
 MAX_NAME_LEN = 255
 MAX_CT_SIZE = CHUNK_SIZE + 512
 
+MAX_CHUNKS = 1_000_000
+
 FIXED_MTIME = 0
 
 _WINDOWS = sys.platform == "win32"
 
+
+
+class _Header:
+
+    __slots__ = (
+        "magic", "time_cost", "memory_cost", "parallelism",
+        "salt", "base_nonce", "original_size", "name_len",
+    )
+
+    def __init__(
+        self,
+        magic: bytes,
+        time_cost: int,
+        memory_cost: int,
+        parallelism: int,
+        salt: bytes,
+        base_nonce: bytes,
+        original_size: int,
+        name_len: int,
+    ) -> None:
+        self.magic = magic
+        self.time_cost = time_cost
+        self.memory_cost = memory_cost
+        self.parallelism = parallelism
+        self.salt = salt
+        self.base_nonce = base_nonce
+        self.original_size = original_size
+        self.name_len = name_len
 
 def derive_key(
     password: str,
@@ -69,6 +100,75 @@ def _neutralize_metadata(path: Path) -> None:
     if not _WINDOWS:
         path.chmod(0o600)
 
+def _parse_header(raw: bytes) -> _Header:
+    if len(raw) < HEADER_SIZE:
+        raise ValueError("File too short or corrupted.")
+
+    magic, time_cost, memory_cost, parallelism, salt, base_nonce, original_size, name_len = (
+        struct.unpack(HEADER_FMT, raw)
+    )
+
+    if not hmac.compare_digest(magic, MAGIC):
+        raise ValueError("This file was not encrypted by cipher (invalid magic).")
+
+    if name_len == 0 or name_len > MAX_NAME_LEN:
+        raise ValueError(f"Invalid filename length in header ({name_len}).")
+
+    return _Header(magic, time_cost, memory_cost, parallelism, salt, base_nonce, original_size, name_len)
+
+
+def read_header(in_path: Path) -> _Header:
+    with open(in_path, "rb") as fin:
+        raw = fin.read(HEADER_SIZE)
+    return _parse_header(raw)
+
+def _iter_chunks(
+    fin: io.BufferedReader,
+    aesgcm: AESGCM,
+    base_nonce: bytes,
+    name_len: int,
+) -> Iterator[tuple[int, bytes, bool]]:
+    counter = 0
+
+    while True:
+        if counter > MAX_CHUNKS:
+            raise ValueError(
+                f"File exceeds maximum chunk count ({MAX_CHUNKS}). "
+                "File may be corrupted or maliciously crafted."
+            )
+
+        size_buf = fin.read(4)
+        if not size_buf:
+            break
+        if len(size_buf) < 4:
+            raise ValueError("Truncated chunk size — file may be corrupted.")
+
+        raw_size = struct.unpack(">I", size_buf)[0]
+        is_padding = bool(raw_size & PADDING_FLAG)
+        ct_len = raw_size & ~PADDING_FLAG
+
+        if ct_len > MAX_CT_SIZE:
+            raise ValueError("Chunk size exceeds maximum — file may be corrupted.")
+
+        ct = fin.read(ct_len)
+        if len(ct) < ct_len:
+            raise ValueError("Truncated chunk — file may be corrupted.")
+
+        nonce = chunk_nonce(base_nonce, counter)
+        try:
+            plaintext = aesgcm.decrypt(nonce, ct, None)
+        except Exception:
+            raise ValueError("Wrong password or file has been tampered with.")
+
+        if is_padding:
+            break
+
+        is_first = counter == 0
+        if is_first and name_len > len(plaintext):
+            raise ValueError("Corrupted header: name_len exceeds first chunk size.")
+
+        yield counter, plaintext, is_first
+        counter += 1
 
 def encrypt_stream(
     in_path: Path,
@@ -77,6 +177,13 @@ def encrypt_stream(
     progress_task=None,
     progress=None,
 ) -> str:
+    if in_path.is_dir():
+        if not os.access(in_path, os.R_OK | os.X_OK):
+            raise PermissionError(f"Cannot read directory: {in_path}")
+    else:
+        if not os.access(in_path, os.R_OK):
+            raise PermissionError(f"Cannot read file: {in_path}")
+
     salt = secrets.token_bytes(SALT_SIZE)
     base_nonce = secrets.token_bytes(NONCE_SIZE)
     key = derive_key(password, salt)
@@ -187,135 +294,47 @@ def decrypt_stream(
     progress=None,
 ) -> tuple[str, int]:
     with open(in_path, "rb") as fin, open(dest, "wb") as fout:
-        raw_header = fin.read(HEADER_SIZE)
-        if len(raw_header) < HEADER_SIZE:
-            raise ValueError("File too short or corrupted.")
-
-        magic, time_cost, memory_cost, parallelism, salt, base_nonce, original_size, name_len = (
-            struct.unpack(HEADER_FMT, raw_header)
-        )
-
-        if not hmac.compare_digest(magic, MAGIC):
-            raise ValueError("This file was not encrypted by cipher (invalid magic).")
-
-        if name_len == 0 or name_len > MAX_NAME_LEN:
-            raise ValueError(f"Invalid filename length in header ({name_len}).")
-
-        key = derive_key(password, salt, time_cost, memory_cost, parallelism)
+        header = _parse_header(fin.read(HEADER_SIZE))
+        key = derive_key(password, header.salt, header.time_cost, header.memory_cost, header.parallelism)
         aesgcm = AESGCM(key)
 
         original_name: str | None = None
-        counter = 0
 
-        while True:
-            size_buf = fin.read(4)
-            if not size_buf:
-                break
-            if len(size_buf) < 4:
-                raise ValueError("Truncated chunk size — file may be corrupted.")
-
-            raw_size = struct.unpack(">I", size_buf)[0]
-            is_padding = bool(raw_size & PADDING_FLAG)
-            ct_len = raw_size & ~PADDING_FLAG
-
-            if ct_len > MAX_CT_SIZE:
-                raise ValueError("Chunk size exceeds maximum — file may be corrupted.")
-
-            ct = fin.read(ct_len)
-            if len(ct) < ct_len:
-                raise ValueError("Truncated chunk — file may be corrupted.")
-
-            nonce = chunk_nonce(base_nonce, counter)
-            try:
-                plaintext = aesgcm.decrypt(nonce, ct, None)
-            except Exception:
-                raise ValueError("Wrong password or file has been tampered with.")
-
-            if is_padding:
-                break
-
-            if counter == 0:
-                if name_len > len(plaintext):
-                    raise ValueError("Corrupted header: name_len exceeds first chunk size.")
-                original_name = plaintext[:name_len].decode()
-                data = plaintext[name_len:]
+        for counter, plaintext, is_first in _iter_chunks(fin, aesgcm, header.base_nonce, header.name_len):
+            if is_first:
+                original_name = plaintext[:header.name_len].decode()
+                data = plaintext[header.name_len:]
             else:
                 data = plaintext
 
             fout.write(data)
-            counter += 1
             if progress is not None and progress_task is not None:
                 progress.update(progress_task, advance=len(data))
 
     if original_name is None:
         raise ValueError("File contains no chunks — file may be corrupted.")
 
-    return original_name, original_size
+    return original_name, header.original_size
 
 
 def verify_stream(in_path: Path, password: str) -> tuple[str, int]:
     with open(in_path, "rb") as fin:
-        raw_header = fin.read(HEADER_SIZE)
-        if len(raw_header) < HEADER_SIZE:
-            raise ValueError("File too short or corrupted.")
-
-        magic, time_cost, memory_cost, parallelism, salt, base_nonce, original_size, name_len = (
-            struct.unpack(HEADER_FMT, raw_header)
-        )
-
-        if not hmac.compare_digest(magic, MAGIC):
-            raise ValueError("This file was not encrypted by cipher (invalid magic).")
-
-        if name_len == 0 or name_len > MAX_NAME_LEN:
-            raise ValueError(f"Invalid filename length in header ({name_len}).")
-
-        key = derive_key(password, salt, time_cost, memory_cost, parallelism)
+        header = _parse_header(fin.read(HEADER_SIZE))
+        key = derive_key(password, header.salt, header.time_cost, header.memory_cost, header.parallelism)
         aesgcm = AESGCM(key)
 
         original_name: str | None = None
-        counter = 0
 
-        while True:
-            size_buf = fin.read(4)
-            if not size_buf:
-                break
-            if len(size_buf) < 4:
-                raise ValueError("Truncated chunk size — file may be corrupted.")
-
-            raw_size = struct.unpack(">I", size_buf)[0]
-            is_padding = bool(raw_size & PADDING_FLAG)
-            ct_len = raw_size & ~PADDING_FLAG
-
-            if ct_len > MAX_CT_SIZE:
-                raise ValueError("Chunk size exceeds maximum — file may be corrupted.")
-
-            ct = fin.read(ct_len)
-            if len(ct) < ct_len:
-                raise ValueError("Truncated chunk — file may be corrupted.")
-
-            nonce = chunk_nonce(base_nonce, counter)
-            try:
-                plaintext = aesgcm.decrypt(nonce, ct, None)
-            except Exception:
-                raise ValueError("Wrong password or file has been tampered with.")
-
-            if is_padding:
-                break
-
-            if counter == 0:
-                if name_len > len(plaintext):
-                    raise ValueError("Corrupted header: name_len exceeds first chunk size.")
-                original_name = plaintext[:name_len].decode()
-
-            counter += 1
+        for counter, plaintext, is_first in _iter_chunks(fin, aesgcm, header.base_nonce, header.name_len):
+            if is_first:
+                original_name = plaintext[:header.name_len].decode()
 
     if original_name is None:
         raise ValueError("File contains no chunks — file may be corrupted.")
 
-    return original_name, original_size
+    return original_name, header.original_size
 
-
-def _open_tar_source(path: Path) -> tuple[io.RawIOBase, threading.Thread, queue.Queue]:
+def _open_tar_source(path: Path) -> tuple[io.RawIOBase, threading.Thread | None, queue.Queue]:
     if _WINDOWS:
         return _open_tar_source_tempfile(path)
     return _open_tar_source_pipe(path)
