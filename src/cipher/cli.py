@@ -17,7 +17,7 @@ from rich.progress import (
     TransferSpeedColumn,
 )
 
-from cipher.crypto import encrypt_stream, decrypt_stream, verify_stream
+from cipher.crypto import encrypt_stream, decrypt_stream, verify_stream, read_header
 from cipher.password import (
     ask_password,
     ask_password_with_strength_check,
@@ -25,6 +25,7 @@ from cipher.password import (
     generate_password,
     schedule_clipboard_clear,
 )
+from cipher.utils import sizeof_fmt
 
 app = typer.Typer(
     name="cipher",
@@ -65,6 +66,7 @@ def encrypt(
         help="Output file (only valid when encrypting a single input)",
     ),
     overwrite: bool = typer.Option(False, "--overwrite", help="Overwrite if destination exists"),
+    yes: bool = typer.Option(False, "-y", "--yes", help="Skip overwrite confirmation prompt"),
     genpass: bool = typer.Option(False, "--genpass", help="Generate a strong random password"),
 ):
     if output is not None and len(files) > 1:
@@ -95,11 +97,20 @@ def encrypt(
             else Path(str(file).rstrip("/") + ".enc")
         )
 
-        if dest.exists() and not overwrite:
-            msg = f"[yellow]⚠ '{dest}' already exists. Use --overwrite to replace it.[/yellow]"
-            console.print(msg)
-            errors.append(str(file))
-            continue
+        if dest.exists():
+            if not overwrite:
+                console.print(
+                    f"[yellow]⚠ '{dest}' already exists. Use --overwrite to replace it.[/yellow]"
+                )
+                errors.append(str(file))
+                continue
+            if not yes:
+                answer = console.input(
+                    f"  [yellow]⚠ '{dest}' already exists. Overwrite? (y/N): [/yellow]"
+                ).strip().lower()
+                if answer not in ("y", "yes"):
+                    console.print("  [dim]Skipped.[/dim]")
+                    continue
 
         file_size = (
             sum(f.stat().st_size for f in file.rglob("*") if f.is_file())
@@ -120,7 +131,11 @@ def encrypt(
                 task = progress.add_task("Encrypting…", total=file_size)
                 sha256 = encrypt_stream(file, password, dest, task, progress)
 
-            console.print(f"[green]✓ {label.capitalize()} successfully encrypted → {dest}[/green]")
+            dest_size = dest.stat().st_size
+            console.print(
+                f"[green]✓ {label.capitalize()} successfully encrypted → {dest}"
+                f" ({sizeof_fmt(dest_size)})[/green]"
+            )
             console.print(f"[dim]SHA-256: {sha256}[/dim]")
 
         except Exception as exc:
@@ -155,15 +170,36 @@ def decrypt(
     file: Path = typer.Argument(..., help=".enc file to decrypt", exists=True),
     output: Optional[Path] = typer.Option(None, "-o", "--output", help="Output file or folder"),
     overwrite: bool = typer.Option(False, "--overwrite", help="Overwrite if destination exists"),
+    yes: bool = typer.Option(False, "-y", "--yes", help="Skip overwrite confirmation prompt"),
 ):
     console.print(Panel(f"[bold]Decrypting[/bold] [cyan]{file}[/cyan]", expand=False))
+    try:
+        header = read_header(file)
+    except ValueError as e:
+        console.print(f"[red]✗ {e}[/red]")
+        raise typer.Exit(1)
+
+    original_name_preview = header.name_len
+
     password = ask_password(confirm=False)
 
     tmp_dest = file.parent / f".{secrets.token_hex(8)}.tmp"
 
     try:
+        file_size = file.stat().st_size
+
         try:
-            original_name, _ = decrypt_stream(file, password, tmp_dest)
+            with Progress(
+                SpinnerColumn(),
+                TextColumn("[progress.description]{task.description}"),
+                BarColumn(),
+                FileSizeColumn(),
+                TransferSpeedColumn(),
+                console=console,
+                transient=True,
+            ) as progress:
+                task = progress.add_task("Decrypting…", total=file_size)
+                original_name, _ = decrypt_stream(file, password, tmp_dest, task, progress)
         except ValueError as e:
             console.print(f"[red]✗ {e}[/red]")
             raise typer.Exit(1)
@@ -174,11 +210,19 @@ def decrypt(
             folder_name = original_name[: -len(".tar.gz")]
             dest = output or file.parent / folder_name
 
-            if dest.exists() and not overwrite:
-                console.print(
-                    f"[yellow]⚠ '{dest}' already exists. Use --overwrite to replace it.[/yellow]"
-                )
-                raise typer.Exit(1)
+            if dest.exists():
+                if not overwrite:
+                    console.print(
+                        f"[yellow]⚠ '{dest}' already exists. Use --overwrite to replace it.[/yellow]"
+                    )
+                    raise typer.Exit(1)
+                if not yes:
+                    answer = console.input(
+                        f"  [yellow]⚠ '{dest}' already exists. Overwrite? (y/N): [/yellow]"
+                    ).strip().lower()
+                    if answer not in ("y", "yes"):
+                        console.print("  [dim]Cancelled.[/dim]")
+                        raise typer.Exit(0)
 
             extract_root = file.parent.resolve()
             with tarfile.open(tmp_dest, "r:gz") as tar:
@@ -197,14 +241,26 @@ def decrypt(
         else:
             dest = output or file.parent / original_name
 
-            if dest.exists() and not overwrite:
-                console.print(
-                    f"[yellow]⚠ '{dest}' already exists. Use --overwrite to replace it.[/yellow]"
-                )
-                raise typer.Exit(1)
+            if dest.exists():
+                if not overwrite:
+                    console.print(
+                        f"[yellow]⚠ '{dest}' already exists. Use --overwrite to replace it.[/yellow]"
+                    )
+                    raise typer.Exit(1)
+                if not yes:
+                    answer = console.input(
+                        f"  [yellow]⚠ '{dest}' already exists. Overwrite? (y/N): [/yellow]"
+                    ).strip().lower()
+                    if answer not in ("y", "yes"):
+                        console.print("  [dim]Cancelled.[/dim]")
+                        raise typer.Exit(0)
 
             tmp_dest.rename(dest)
-            console.print(f"[green]✓ File successfully decrypted → {dest}[/green]")
+            dest_size = dest.stat().st_size
+            console.print(
+                f"[green]✓ File successfully decrypted → {dest}"
+                f" ({sizeof_fmt(dest_size)})[/green]"
+            )
 
     finally:
         if tmp_dest.exists():
