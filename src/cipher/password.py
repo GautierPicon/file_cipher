@@ -1,3 +1,4 @@
+import math
 import secrets
 import string
 import subprocess
@@ -63,6 +64,31 @@ def schedule_clipboard_clear(delay: int = 30) -> None:
     t.start()
 
 
+def _shannon_entropy(password: str) -> float:
+    if not password:
+        return 0.0
+    freq = {}
+    for c in password:
+        freq[c] = freq.get(c, 0) + 1
+    n = len(password)
+    return -sum((count / n) * math.log2(count / n) for count in freq.values())
+
+
+def _max_consecutive(password: str) -> int:
+    if not password:
+        return 0
+    max_run = 1
+    current_run = 1
+    for i in range(1, len(password)):
+        if password[i] == password[i - 1]:
+            current_run += 1
+            if current_run > max_run:
+                max_run = current_run
+        else:
+            current_run = 1
+    return max_run
+
+
 def check_password_strength(password: str) -> tuple[bool, str]:
     issues = []
 
@@ -80,6 +106,13 @@ def check_password_strength(password: str) -> tuple[bool, str]:
     common = {"password", "admin", "123456", "qwerty", "letmein", "welcome"}
     if password.lower() in common:
         issues.append("common password")
+
+    if _max_consecutive(password) >= 4:
+        issues.append("too many repeated consecutive characters (≥ 4 in a row)")
+
+    entropy = _shannon_entropy(password)
+    if entropy < 3.0:
+        issues.append(f"low entropy ({entropy:.1f} bits/char, min 3.0)")
 
     if issues:
         return False, f"[yellow]⚠ Weak password: {', '.join(issues)}[/yellow]"
