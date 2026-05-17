@@ -17,22 +17,25 @@ PATCH_SCHED    = "cipher.cli.schedule_clipboard_clear"
 
 
 def _encrypt(tmp_path: Path, *extra_args, files=None, password=PASSWORD):
-    """Run `cipher encrypt <files> [extra_args]` with a mocked password."""
     if files is None:
         raise ValueError("provide at least one file path")
     paths = [str(f) for f in files]
+    args = list(extra_args)
+    if "--overwrite" in args and "--yes" not in args and "-y" not in args:
+        args.append("--yes")
     with patch(PATCH_STRENGTH, return_value=password):
-        return runner.invoke(app, ["encrypt", *paths, *extra_args])
+        return runner.invoke(app, ["encrypt", *paths, *args])
 
 
 def _decrypt(enc: Path, *extra_args, password=PASSWORD):
-    """Run `cipher decrypt <enc> [extra_args]` with a mocked password."""
+    args = list(extra_args)
+    if "--overwrite" in args and "--yes" not in args and "-y" not in args:
+        args.append("--yes")
     with patch(PATCH_ASK, return_value=password):
-        return runner.invoke(app, ["decrypt", str(enc), *extra_args])
+        return runner.invoke(app, ["decrypt", str(enc), *args])
 
 
 def _verify(enc: Path, password=PASSWORD):
-    """Run `cipher verify <enc>` with a mocked password."""
     with patch(PATCH_ASK, return_value=password):
         return runner.invoke(app, ["verify", str(enc)])
 
@@ -231,7 +234,7 @@ class TestDecrypt:
         src.write_bytes(b"data")
         _encrypt(tmp_path, files=[src])
         enc = tmp_path / "data.enc"
-        result = _decrypt(enc) 
+        result = _decrypt(enc)
         assert result.exit_code == 1
         assert "already exists" in result.output
 
@@ -242,6 +245,25 @@ class TestDecrypt:
         enc = tmp_path / "data.enc"
         result = _decrypt(enc, "--overwrite")
         assert result.exit_code == 0
+
+    def test_overwrite_without_yes_prompts(self, tmp_path):
+        src = tmp_path / "data.txt"
+        src.write_bytes(b"data")
+        _encrypt(tmp_path, files=[src])
+        enc = tmp_path / "data.enc"
+        with patch(PATCH_ASK, return_value=PASSWORD):
+            result = runner.invoke(app, ["decrypt", str(enc), "--overwrite"], input="y\n")
+        assert result.exit_code == 0
+
+    def test_overwrite_prompt_refused(self, tmp_path):
+        src = tmp_path / "data.txt"
+        src.write_bytes(b"data")
+        _encrypt(tmp_path, files=[src])
+        enc = tmp_path / "data.enc"
+        with patch(PATCH_ASK, return_value=PASSWORD):
+            result = runner.invoke(app, ["decrypt", str(enc), "--overwrite"], input="n\n")
+        assert result.exit_code == 0
+        assert "Cancelled" in result.output
 
 
 class TestVerify:
